@@ -74,6 +74,9 @@ from lib.types import (
 )
 from lib.util import SCIONTime, hex_str, sleep_interval
 
+# Extension imports
+from hornet_scion.router import RouterPlugin as HORNETPlugin
+
 
 MAX_EXT = 4  # Maximum number of hop-by-hop extensions processed by router.
 
@@ -118,6 +121,9 @@ class Router(SCIONElement):
         self.pre_ext_handlers = {
             SibraExtBase.EXT_TYPE: self.handle_sibra,
             TracerouteExt.EXT_TYPE: self.handle_traceroute,
+            HORNETPlugin.EXT_TYPE: HORNETPlugin(
+                self.id, self.config.master_as_key, self.addr, self.interface
+            ).pre_routing
         }
         self.post_ext_handlers = {}
         self.sibra_state = SibraState(self.interface.bandwidth,
