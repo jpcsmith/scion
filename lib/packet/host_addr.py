@@ -94,7 +94,7 @@ class HostAddrNone(HostAddrBase):  # pragma: no cover
     TYPE = AddrType.NONE
     LEN = 0
 
-    def __init__(self):
+    def __init__(self, *args):
         self.addr = None
 
     def _parse(self, raw):
