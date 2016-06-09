@@ -778,7 +778,7 @@ class AddressGenerator(object):
         return self._addrs[id_]
 
     def alloc_addrs(self, subnet):
-        hosts = subnet.hosts()
+        hosts = iter(subnet)
         interfaces = {}
         for elem, proxy in sorted(self._addrs.items()):
             intf = ip_interface("%s/%s" % (next(hosts), subnet.prefixlen))
