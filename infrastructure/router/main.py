@@ -25,6 +25,7 @@ from collections import defaultdict
 
 # External packages
 from Crypto.Protocol.KDF import PBKDF2
+from hornet_scion.router import RouterPlugin as HORNETPlugin
 
 # SCION
 from external.expiring_dict import ExpiringDict
@@ -130,10 +131,14 @@ class Router(SCIONElement):
             SibraExtBase.EXT_TYPE: self.handle_sibra,
             TracerouteExt.EXT_TYPE: self.handle_traceroute,
             ExtHopByHopType.SCMP: self.handle_scmp,
+            HORNETPlugin.EXT_TYPE: HORNETPlugin(
+                self.id, conf_dir, self.config.master_as_key, self.addr,
+                self.interface
+            ).pre_routing
         }
         self.post_ext_handlers = {
             SibraExtBase.EXT_TYPE: False, TracerouteExt.EXT_TYPE: False,
-            ExtHopByHopType.SCMP: False,
+            ExtHopByHopType.SCMP: False, HORNETPlugin.EXT_TYPE: False
         }
         self.sibra_state = SibraState(self.interface.bandwidth,
                                       self.addr.isd_as)
