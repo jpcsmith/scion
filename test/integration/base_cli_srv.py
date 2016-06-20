@@ -28,9 +28,10 @@ import sys
 import threading
 import time
 from abc import ABCMeta, abstractmethod
+from itertools import product
 
 # SCION
-from endhost.sciond import SCIONDaemon
+from endhost.sciond import SCIOND_API_SOCKDIR, SCIONDaemon
 from lib.defines import AS_LIST_FILE, GEN_PATH
 from lib.log import init_logging
 from lib.main import main_wrapper
@@ -43,9 +44,8 @@ from lib.packet.path import SCIONPath
 from lib.packet.scion import SCIONL4Packet, build_base_hdrs
 from lib.packet.scion_addr import ISD_AS, SCIONAddr
 from lib.packet.scion_udp import SCIONUDPHeader
-from lib.socket import DispatcherSocket, UDPSocket
+from lib.socket import ReliableSocket
 from lib.thread import kill_self, thread_safety_net
-from lib.types import AddrType
 from lib.util import (
     Raw,
     handle_signals,
@@ -56,18 +56,23 @@ API_TOUT = 15
 
 
 class TestBase(object, metaclass=ABCMeta):
-    def __init__(self, sd, data, finished, addr):
+    def __init__(self, sd, data, finished, addr, timeout=1.0):
         self.sd = sd
         self.data = data
         self.finished = finished
         self.addr = addr
-        self.sock = DispatcherSocket(addr, 0)
-        self.sock.settimeout(1.0)
+        self._timeout = timeout
+        self.sock = self._create_socket(addr)
         self.success = None
 
     @abstractmethod
     def run(self):
         raise NotImplementedError
+
+    def _create_socket(self, addr):
+        sock = ReliableSocket(reg=(addr, 0, True, None))
+        sock.settimeout(self._timeout)
+        return sock
 
     def _recv(self):
         try:
@@ -92,13 +97,12 @@ class TestClientBase(TestBase):
     """
     def __init__(self, sd, data, finished, addr, dst, dport, api=True,
                  timeout=3.0):
-        super().__init__(sd, data, finished, addr)
-        self.sock.settimeout(timeout)
         self.dst = dst
         self.dport = dport
         self.api = api
         self.path = None
         self.iflist = []
+        super().__init__(sd, data, finished, addr, timeout)
         self._get_path(api)
 
     def _get_path(self, api):
@@ -126,15 +130,18 @@ class TestClientBase(TestBase):
             self.iflist.append((isd_as, ifid))
 
     def _try_sciond_api(self):
-        sock = UDPSocket(bind=("127.0.0.1", 0), addr_type=AddrType.IPV4)
+        sock = ReliableSocket()
         msg = b'\x00' + self.dst.isd_as.pack()
         start = time.time()
+        try:
+            sock.connect(self.sd.api_addr)
+        except OSError as e:
+            logging.critical("Error connecting to sciond: %s", e)
+            kill_self()
         while time.time() - start < API_TOUT:
-            addr = self.sd.api_addr
-            port = self.sd.api_port
-            logging.debug("Sending path request to local API (%s:%s)",
-                          addr, port)
-            sock.send(msg, (addr, port))
+            logging.debug("Sending path request to local API at %s",
+                          self.sd.api_addr)
+            sock.send(msg)
             data = Raw(sock.recv()[0], "Path response")
             if data:
                 sock.close()
@@ -229,39 +236,62 @@ class TestClientServerBase(object):
     """
     Test module to run client and server
     """
-    def __init__(self, client, server, sources, destinations, local=True):
+    NAME = ""
+
+    def __init__(self, client, server, sources, destinations, local=True,
+                 max_runs=None):
+        assert self.NAME
+        t = threading.current_thread()
+        t.name = self.NAME
         self.client_ip = haddr_parse_interface(client)
         self.server_ip = haddr_parse_interface(server)
         self.src_ias = sources
         self.dst_ias = destinations
         self.local = local
         self.scionds = {}
+        self.max_runs = max_runs
 
     def run(self):
+        try:
+            self._run()
+        finally:
+            self._stop_scionds()
+        logging.info("All tests successful")
+
+    def _run(self):
         """
         Run a test for every pair of src and dst
         """
-        for src_ia in self.src_ias:
-            for dst_ia in self.dst_ias:
-                if not self.local and src_ia == dst_ia:
-                    continue
-                self._run_test(src_ia, dst_ia)
+        # Generate all possible pairs, and randomise the order.
+        pairs = list(product(self.src_ias, self.dst_ias))
+        random.shuffle(pairs)
+        count = 0
+        for src_ia, dst_ia in pairs:
+            if not self.local and src_ia == dst_ia:
+                continue
+            count += 1
+            if self.max_runs and count > self.max_runs:
+                logging.debug("Hit max runs (%d), stopping", self.max_runs)
+                break
+            src = SCIONAddr.from_values(src_ia, self.client_ip)
+            dst = SCIONAddr.from_values(dst_ia, self.server_ip)
+            t = threading.current_thread()
+            t.name = "%s %s > %s main" % (self.NAME, src_ia, dst_ia)
+            if not self._run_test(src, dst):
+                sys.exit(1)
 
-    def _run_test(self, src_ia, dst_ia):
+    def _run_test(self, src, dst):
         """
         Run client and server, wait for both to finish
         """
-        logging.info("Testing: %s -> %s", src_ia, dst_ia)
+        logging.info("Testing: %s -> %s", src.isd_as, dst.isd_as)
         # finished is used by the client/server to signal to the other that they
         # are stopping.
         finished = threading.Event()
-        src_addr = SCIONAddr.from_values(src_ia, self.client_ip)
-        dst_addr = SCIONAddr.from_values(dst_ia, self.server_ip)
-        data = self._create_data()
-        server = self._create_server(data, finished, dst_addr)
-        client = self._create_client(data, finished, src_addr, dst_addr,
-                                     server.sock.port)
-        server_name = "Server %s" % dst_ia
+        data = self._create_data(src, dst)
+        server = self._create_server(data, finished, dst)
+        client = self._create_client(data, finished, src, dst, server.sock.port)
+        server_name = "%s %s > %s server" % (self.NAME, src.isd_as, dst.isd_as)
         s_thread = threading.Thread(
             target=thread_safety_net, args=(server.run,), name=server_name,
             daemon=True)
@@ -269,22 +299,22 @@ class TestClientServerBase(object):
         client.run()
         # If client is finished, server should finish within ~1s (due to recv
         # timeout). If it hasn't, then there was a problem.
-        s_thread.join(2.0)
+        s_thread.join(5.0)
         if s_thread.is_alive():
             logging.error("Timeout waiting for server thread to terminate")
-            sys.exit(1)
+            return False
+        return self._check_result(client, server)
+
+    def _check_result(self, client, server):
         if client.success and server.success:
             logging.debug("Success")
-            return
+            return True
         logging.error("Client success? %s Server success? %s",
                       client.success, server.success)
-        sys.exit(1)
+        return False
 
-    def _create_data(self):
-        """
-        Create raw payload data
-        """
-        return b""
+    def _create_data(self, src, dst):
+        return ("%s <-> %s" % (src.isd_as, dst.isd_as)).encode("UTF-8")
 
     def _create_server(self, data, finished, addr):
         """
@@ -303,16 +333,21 @@ class TestClientServerBase(object):
         if addr.isd_as not in self.scionds:
             logging.debug("Starting sciond for %s", addr.isd_as)
             # Local api on, random port, random api port
-            self.scionds[addr.isd_as] = start_sciond(addr, api=True)
+            self.scionds[addr.isd_as] = start_sciond(
+                addr, api=True, api_addr=SCIOND_API_SOCKDIR + "%s_%s.sock" %
+                (self.NAME, addr.isd_as))
         return self.scionds[addr.isd_as]
 
+    def _stop_scionds(self):
+        for sd in self.scionds.values():
+            sd.stop()
 
-def start_sciond(addr, api=False, port=0, api_addr=None, api_port=0):
+
+def start_sciond(addr, api=False, port=0, api_addr=None):
     conf_dir = "%s/ISD%d/AS%d/endhost" % (
         GEN_PATH, addr.isd_as[0], addr.isd_as[1])
     return SCIONDaemon.start(
-        conf_dir, addr.host, api_addr=api_addr, run_local_api=api, port=port,
-        api_port=api_port)
+        conf_dir, addr.host, api_addr=api_addr, run_local_api=api, port=port)
 
 
 def _load_as_list():
@@ -331,17 +366,23 @@ def _parse_locs(as_str, as_list):
     return copied
 
 
-def setup_main(name):
+def setup_main(name, parser=None):
     handle_signals()
-    parser = argparse.ArgumentParser()
+    parser = parser or argparse.ArgumentParser()
+    parser.add_argument('-l', '--loglevel', default="INFO",
+                        help='Console logging level (Default: %(default)s)')
     parser.add_argument('-c', '--client', help='Client address')
     parser.add_argument('-s', '--server', help='Server address')
     parser.add_argument('-m', '--mininet', action='store_true',
                         help="Running under mininet")
+    parser.add_argument("-r", "--runs", type=int,
+                        help="Limit the number of pairs tested")
+    parser.add_argument("-w", "--wait", type=float, default=0.0,
+                        help="Time in seconds to wait before running")
     parser.add_argument('src_ia', nargs='?', help='Src isd-as')
     parser.add_argument('dst_ia', nargs='?', help='Dst isd-as')
     args = parser.parse_args()
-    init_logging("logs/%s" % name, console_level=logging.INFO)
+    init_logging("logs/%s" % name, console_level=args.loglevel)
 
     if not args.client:
         args.client = "169.254.0.2" if args.mininet else "127.0.0.2"

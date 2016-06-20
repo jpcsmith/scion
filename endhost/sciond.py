@@ -17,6 +17,7 @@
 """
 # Stdlib
 import logging
+import os
 import struct
 import threading
 from itertools import product
@@ -25,33 +26,30 @@ from itertools import product
 from infrastructure.scion_elem import SCIONElement
 from lib.crypto.hash_chain import HashChain
 from lib.defines import (
+    PATH_FLAG_SIBRA,
     PATH_SERVICE,
-    SCION_UDP_PORT,
     SCION_UDP_EH_DATA_PORT,
+    SCION_UDP_PORT,
 )
 from lib.errors import SCIONServiceLookupError
-from lib.flagtypes import PathSegFlags as PSF
 from lib.log import log_exception
 from lib.packet.host_addr import haddr_parse
 from lib.packet.path import PathCombinator, SCIONPath
-from lib.packet.path_mgmt import PathSegmentReq
-from lib.packet.pcb_ext import BeaconExtType
+from lib.packet.path_mgmt.seg_req import PathSegmentReq
 from lib.packet.scion_addr import ISD_AS
 from lib.path_db import DBResult, PathSegmentDB
 from lib.requests import RequestHandler
 from lib.sibra.ext.resv import ResvBlockSteady
-from lib.socket import UDPSocket
+from lib.socket import ReliableSocket
 from lib.thread import thread_safety_net
 from lib.types import (
-    AddrType,
     PathMgmtType as PMT,
     PathSegmentType as PST,
     PayloadClass,
 )
 from lib.util import SCIONTime
 
-SCIOND_API_HOST = "127.255.255.254"
-SCIOND_API_PORT = 3333
+SCIOND_API_SOCKDIR = "/run/shm/sciond/"
 
 
 class SCIONDaemon(SCIONElement):
@@ -67,7 +65,7 @@ class SCIONDaemon(SCIONElement):
     MAX_SEG_NO = 5  # TODO: replace by config variable.
 
     def __init__(self, conf_dir, addr, api_addr, run_local_api=False,
-                 port=SCION_UDP_PORT, api_port=SCIOND_API_PORT):
+                 port=SCION_UDP_PORT):
         """
         Initialize an instance of the class SCIONDaemon.
         """
@@ -84,10 +82,12 @@ class SCIONDaemon(SCIONElement):
             req_name, self._check_segments, self._fetch_segments,
             self._reply_segments, ttl=self.TIMEOUT, key_map=self._req_key_map,
         )
-        self._api_socket = None
+        self._api_sock = None
         self.daemon_thread = None
-        self.api_addr = api_addr or SCIOND_API_HOST
-        self.api_port = api_port
+        os.makedirs(SCIOND_API_SOCKDIR, exist_ok=True)
+        self.api_addr = (api_addr or
+                         os.path.join(SCIOND_API_SOCKDIR,
+                                      "%s.sock" % self.addr.isd_as))
 
         self.CTRL_PLD_CLASS_MAP = {
             PayloadClass.PATH: {
@@ -96,15 +96,12 @@ class SCIONDaemon(SCIONElement):
             }
         }
         if run_local_api:
-            self._api_sock = UDPSocket(
-                bind=(self.api_addr, self.api_port, "sciond local API"),
-                addr_type=AddrType.IPV4)
-            self.api_port = self._api_sock.port
-            self._socks.add(self._api_sock)
+            self._api_sock = ReliableSocket(bind=(self.api_addr, "sciond"))
+            self._socks.add(self._api_sock, self.handle_accept)
 
     @classmethod
     def start(cls, conf_dir, addr, api_addr=None, run_local_api=False,
-              port=SCION_UDP_PORT, api_port=SCIOND_API_PORT):
+              port=SCION_UDP_PORT):
         """
         Initializes, starts, and returns a SCIONDaemon object.
 
@@ -112,14 +109,15 @@ class SCIONDaemon(SCIONElement):
         sd = SCIONDaemon.start(conf_dir, addr)
         paths = sd.get_paths(isd_as)
         """
-        inst = cls(conf_dir, addr, api_addr, run_local_api, port, api_port)
+        inst = cls(conf_dir, addr, api_addr, run_local_api, port)
         name = "SCIONDaemon.run %s" % inst.addr.isd_as
         inst.daemon_thread = threading.Thread(
             target=thread_safety_net, args=(inst.run,), name=name, daemon=True)
         inst.daemon_thread.start()
+        logging.debug("sciond started with api_addr = %s", inst.api_addr)
         return inst
 
-    def handle_request(self, packet, sender, from_local_socket=True):
+    def handle_request(self, packet, sender, from_local_socket=True, sock=None):
         # PSz: local_socket may be misleading, especially that we have
         # api_socket which is local (in the localhost sense). What do you think
         # about changing local_socket to as_socket
@@ -127,7 +125,7 @@ class SCIONDaemon(SCIONElement):
         Main routine to handle incoming SCION packets.
         """
         if not from_local_socket:  # From localhost (SCIONDaemon API)
-            self.api_handle_request(packet, sender)
+            self.api_handle_request(packet, sock)
             return
         super().handle_request(packet, sender, from_local_socket)
 
@@ -142,28 +140,26 @@ class SCIONDaemon(SCIONElement):
             PST.DOWN: self._handle_down_seg,
             PST.CORE: self._handle_core_seg,
         }
-        for type_, pcbs in path_reply.pcbs.items():
-            for pcb in pcbs:
-                ret = map_[type_](pcb)
-                if not ret:
-                    continue
-                added.add((ret, pcb.flags))
+        for type_, pcb in path_reply.iter_pcbs():
+            ret = map_[type_](pcb)
+            if not ret:
+                continue
+            flags = (PATH_FLAG_SIBRA,) if pcb.is_sibra() else ()
+            added.add((ret, flags))
         logging.debug("Added: %s", added)
         for dst_ia, flags in added:
             self.requests.put(((dst_ia, flags), None))
 
     def _handle_up_seg(self, pcb):
-        first_ia = pcb.get_first_pcbm().isd_as
-        last_ia = pcb.get_last_pcbm().isd_as
-        if self.addr.isd_as != last_ia:
+        if self.addr.isd_as != pcb.last_ia():
             return None
         if self.up_segments.update(pcb) == DBResult.ENTRY_ADDED:
             logging.debug("Up segment added: %s", pcb.short_desc())
-            return first_ia
+            return pcb.first_ia()
         return None
 
     def _handle_down_seg(self, pcb):
-        last_ia = pcb.get_last_pcbm().isd_as
+        last_ia = pcb.last_ia()
         if self.addr.isd_as == last_ia:
             return None
         if self.down_segments.update(pcb) == DBResult.ENTRY_ADDED:
@@ -172,29 +168,28 @@ class SCIONDaemon(SCIONElement):
         return None
 
     def _handle_core_seg(self, pcb):
-        first_ia = pcb.get_first_pcbm().isd_as
         if self.core_segments.update(pcb) == DBResult.ENTRY_ADDED:
             logging.debug("Core segment added: %s", pcb.short_desc())
-            return first_ia
+            return pcb.first_ia()
         return None
 
-    def api_handle_request(self, packet, sender):
+    def api_handle_request(self, packet, sock):
         """
         Handle local API's requests.
         """
         if packet[0] == 0:  # path request
-            logging.debug('API: path request from %s.', sender)
+            logging.debug('API: path request')
             threading.Thread(
                 target=thread_safety_net,
-                args=(self._api_handle_path_request, packet, sender),
+                args=(self._api_handle_path_request, packet, sock),
                 daemon=True).start()
         elif packet[0] == 1:  # address request
-            logging.debug('API: local addr request from %s', sender)
-            self._api_sock.send(self.addr.pack(), sender)
+            logging.debug('API: local ISD-AS request')
+            sock.send(self.addr.isd_as.pack())
         else:
             logging.warning("API: type %d not supported.", packet[0])
 
-    def _api_handle_path_request(self, packet, sender):
+    def _api_handle_path_request(self, packet, sock):
         """
         Path request:
           | \x00 (1B) | ISD (12bits) |  AS (20bits)  |
@@ -220,7 +215,10 @@ class SCIONDaemon(SCIONElement):
             fwd_if = path.get_fwd_if()
             # Set dummy host addr if path is empty.
             # TODO(PSz): remove dummy "0.0.0.0" address when API is saner
-            haddr = self.ifid2addr.get(fwd_if, haddr_parse("IPV4", "0.0.0.0"))
+            if fwd_if == 0:
+                haddr = haddr_parse("IPV4", "0.0.0.0")
+            else:
+                haddr = self.ifid2er[fwd_if].addr
             path_len = len(raw_path) // 8
             reply.append(struct.pack("!B", path_len) + raw_path +
                          haddr.pack() +
@@ -231,15 +229,9 @@ class SCIONDaemon(SCIONElement):
                 isd_as, link = interface
                 reply.append(isd_as.pack())
                 reply.append(struct.pack("!H", link))
-        self._api_sock.send(b"".join(reply), sender)
+        sock.send(b"".join(reply))
 
     def handle_revocation(self, pkt):
-        """
-        Handle revocation.
-
-        :param rev_info: The RevocationInfo object.
-        :type rev_info: :class:`lib.packet.path_mgmt.RevocationInfo`
-        """
         rev_info = pkt.get_payload()
         logging.debug("Received revocation:\n%s", str(rev_info))
         # Verify revocation.
@@ -276,16 +268,16 @@ class SCIONDaemon(SCIONElement):
 
         return db.delete_all(to_remove)
 
-    def get_paths(self, dst_ia, flags=0):
+    def get_paths(self, dst_ia, flags=()):
         """Return a list of paths."""
-        logging.debug("Paths requested for %s", dst_ia)
+        logging.debug("Paths requested for %s %s", dst_ia, flags)
         if self.addr.isd_as == dst_ia or (
                 self.addr.isd_as.any_as() == dst_ia and
                 self.topology.is_core_as):
             # Either the destination is the local AS, or the destination is any
             # core AS in this ISD, and the local AS is in the core
             empty = SCIONPath()
-            empty.mtu = self.config.mtu
+            empty.mtu = self.topology.mtu
             return [empty]
         deadline = SCIONTime.get_time() + self.TIMEOUT
         e = threading.Event()
@@ -295,10 +287,10 @@ class SCIONDaemon(SCIONElement):
             return []
         return self.path_resolution(dst_ia, flags=flags)
 
-    def path_resolution(self, dst_ia, flags=0):
+    def path_resolution(self, dst_ia, flags=()):
         # dst as == 0 means any core AS in the specified ISD.
         dst_is_core = self.is_core_as(dst_ia) or dst_ia[1] == 0
-        sibra = bool(flags & PSF.SIBRA)
+        sibra = PATH_FLAG_SIBRA in flags
         if self.topology.is_core_as:
             if dst_is_core:
                 ret = self._resolve_core_core(dst_ia, sibra=sibra)
@@ -335,7 +327,7 @@ class SCIONDaemon(SCIONElement):
                 res.add((None, None, dseg))
         # Check core-down combination.
         for dseg in self.down_segments(last_ia=dst_ia, sibra=sibra):
-            dseg_ia = dseg.get_first_pcbm().isd_as
+            dseg_ia = dseg.first_ia()
             if self.addr.isd_as == dseg_ia:
                 pass
             for cseg in self.core_segments(
@@ -357,8 +349,7 @@ class SCIONDaemon(SCIONElement):
         # Check whether dst is known core AS.
         for cseg in self.core_segments(**params):
             # Check do we have an up-seg that is connected to core_seg.
-            cseg_ia = cseg.get_last_pcbm().isd_as
-            for useg in self.up_segments(first_ia=cseg_ia, sibra=sibra):
+            for useg in self.up_segments(first_ia=cseg.last_ia(), sibra=sibra):
                 res.add((useg, cseg, None))
         if sibra:
             return res
@@ -385,14 +376,13 @@ class SCIONDaemon(SCIONElement):
         up_segs = set(self.up_segments(sibra=True))
         down_segs = set(self.down_segments(last_ia=dst_ia, sibra=True))
         for up_seg, down_seg in product(up_segs, down_segs):
-            src_core_ia = up_seg.get_first_pcbm().isd_as
-            dst_core_ia = down_seg.get_first_pcbm().isd_as
+            src_core_ia = up_seg.first_ia()
+            dst_core_ia = down_seg.first_ia()
             if src_core_ia == dst_core_ia:
                 res.add((up_seg, down_seg))
                 continue
-            core_seg = self.core_segments(first_ia=src_core_ia,
-                                          last_ia=dst_core_ia, sibra=True)
-            if core_seg:
+            for core_seg in self.core_segments(first_ia=dst_core_ia,
+                                               last_ia=src_core_ia, sibra=True):
                 res.add((up_seg, core_seg, down_seg))
         return res
 
@@ -413,17 +403,33 @@ class SCIONDaemon(SCIONElement):
         return ret
 
     def _sibra_strip_pcb(self, pcb):
-        last_asm = pcb.ases[-1]
-        info_ext = last_asm.find_ext(BeaconExtType.SIBRA_SEG_INFO)
-        assert info_ext
-        resv_info = info_ext.info
+        assert pcb.is_sibra()
+        pcb_ext = pcb.sibra_ext
+        resv_info = pcb_ext.info
         resv = ResvBlockSteady.from_values(resv_info, pcb.get_n_hops())
-        asms = reversed(pcb.ases) if resv_info.fwd_dir else pcb.ases
-        for asm in asms:
-            sof_ext = asm.find_ext(BeaconExtType.SIBRA_SEG_SOF)
-            resv.sofs.append(sof_ext.sof)
+        asms = pcb.iter_asms()
+        if pcb_ext.p.up:
+            asms = reversed(list(asms))
+        iflist = []
+        for sof, asm in zip(pcb_ext.iter_sofs(), asms):
+            resv.sofs.append(sof)
+            iflist.extend(self._sibra_add_ifs(
+                asm.isd_as(), sof, resv_info.fwd_dir))
         assert resv.num_hops == len(resv.sofs)
-        return info_ext.id, resv
+        return pcb_ext.p.id, resv, iflist
+
+    def _sibra_add_ifs(self, isd_as, sof, fwd):
+        def _add(ifid):
+            if ifid:
+                ret.append((isd_as, ifid))
+        ret = []
+        if fwd:
+            _add(sof.ingress)
+            _add(sof.egress)
+        else:
+            _add(sof.egress)
+            _add(sof.ingress)
+        return ret
 
     def _wait_for_events(self, events, deadline):
         """
@@ -471,9 +477,11 @@ class SCIONDaemon(SCIONElement):
         `key`.
         """
         ans_ia, ans_flags = key
+        ans_f_set = set(ans_flags)
         ret = []
         for req_ia, req_flags in req_keys:
-            if req_flags != ans_flags and (not ans_flags & req_flags):
+            req_f_set = set(req_flags)
+            if req_f_set != ans_f_set and (not ans_f_set & req_f_set):
                 # The answer and the request have no flags in common, so skip
                 # it.
                 continue
@@ -492,9 +500,9 @@ class SCIONDaemon(SCIONElement):
         src_core_ases = set()
         dst_core_ases = set()
         for seg in up_segs:
-            src_core_ases.add(seg.get_first_pcbm().isd_as[1])
+            src_core_ases.add(seg.first_ia()[1])
         for seg in down_segs:
-            dst_core_ases.add(seg.get_first_pcbm().isd_as[1])
+            dst_core_ases.add(seg.first_ia()[1])
         # Generate all possible AS pairs
         as_pairs = list(product(src_core_ases, dst_core_ases))
         return self._find_core_segs(self.addr.isd_as[0], dst_isd, as_pairs)

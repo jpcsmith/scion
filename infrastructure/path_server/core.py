@@ -21,12 +21,10 @@ from collections import deque
 
 # SCION
 from infrastructure.path_server.base import PathServer
-from lib.flagtypes import PathSegFlags as PSF
+from lib.defines import PATH_FLAG_SIBRA
 from lib.packet.host_addr import haddr_parse
-from lib.packet.path_mgmt import (
-    PathRecordsReply,
-    PathSegmentReq,
-)
+from lib.packet.path_mgmt.seg_recs import PathRecordsReply
+from lib.packet.path_mgmt.seg_req import PathSegmentReq
 from lib.packet.scion import SVCType
 from lib.types import PathMgmtType as PMT, PathSegmentType as PST
 from lib.zookeeper import ZkNoConnection
@@ -80,7 +78,7 @@ class CorePathServer(PathServer):
         core_segs = []
         # Find all core segments from remote ISDs
         for pcb in self.core_segments(full=True):
-            if pcb.get_first_pcbm().isd_as[0] != self.addr.isd_as[0]:
+            if pcb.first_ia()[0] != self.addr.isd_as[0]:
                 core_segs.append(pcb)
         # Find down-segments from local ISD.
         down_segs = self.down_segments(full=True, last_isd=self.addr.isd_as[0])
@@ -88,7 +86,7 @@ class CorePathServer(PathServer):
         seen_ases = set()
         for seg_type, segs in [(PST.CORE, core_segs), (PST.DOWN, down_segs)]:
             for pcb in segs:
-                key = pcb.get_first_pcbm().isd_as, pcb.get_last_pcbm().isd_as
+                key = pcb.first_ia(), pcb.last_ia()
                 # Send only one SCION segment for given (src, dst) pair.
                 if not pcb.is_sibra() and key in seen_ases:
                     continue
@@ -102,18 +100,18 @@ class CorePathServer(PathServer):
         logging.error("Core Path Server received up-segment record!")
         return set()
 
-    def _handle_down_segment_record(self, pcb, from_master=False):
+    def _handle_down_segment_record(self, pcb, from_master=False,
+                                    from_zk=False):
         added = self._add_segment(pcb, self.down_segments, "Down")
-        first_ia = pcb.get_first_pcbm().isd_as
-        last_ia = pcb.get_last_pcbm().isd_as
+        first_ia = pcb.first_ia()
+        last_ia = pcb.last_ia()
         if first_ia == self.addr.isd_as:
             # Segment is to us, so propagate to all other core ASes within the
             # local ISD.
             self._segs_to_prop.append((PST.DOWN, pcb))
-        if (first_ia[0] == last_ia[0] == self.addr.isd_as[0] and not
-                from_master):
-            # Master gets a copy of all local segments.
-            self._segs_to_master.append((PST.DOWN, pcb))
+        if (first_ia[0] == last_ia[0] == self.addr.isd_as[0] and not from_zk):
+            # Sync all local down segs via zk
+            self._segs_to_zk.append((PST.DOWN, pcb))
         if added:
             return set([(last_ia, pcb.is_sibra())])
         return set()
@@ -121,8 +119,12 @@ class CorePathServer(PathServer):
     def _handle_core_segment_record(self, pcb, from_master=False,
                                     from_zk=False):
         """Handle registration of a core segment."""
-        first_ia = pcb.get_first_pcbm().isd_as
-        added = self._add_segment(pcb, self.core_segments, "Core")
+        first_ia = pcb.first_ia()
+        reverse = False
+        if pcb.is_sibra() and first_ia == self.addr.isd_as:
+            reverse = True
+        added = self._add_segment(pcb, self.core_segments, "Core",
+                                  reverse=reverse)
         if not from_zk and not from_master:
             if first_ia[0] == self.addr.isd_as[0]:
                 # Local core segment, share via ZK
@@ -134,7 +136,7 @@ class CorePathServer(PathServer):
             return set()
         # Send pending requests that couldn't be processed due to the lack of
         # a core segment to the destination PS.
-        self._handle_waiting_targets(pcb)
+        self._handle_waiting_targets(pcb, reverse=reverse)
         ret = set([(first_ia, pcb.is_sibra())])
         if first_ia[0] != self.addr.isd_as[0]:
             # Remote core segment, signal the entire ISD
@@ -183,10 +185,11 @@ class CorePathServer(PathServer):
         if not master:
             logging.warning("_send_to_master(): _master_id not set.")
             return
-        pkt = self._build_packet(haddr_parse("IPV4", master), payload=pld)
+        pkt = self._build_packet(haddr_parse("IPV4", master),
+                                 payload=pld.copy())
         self.send(pkt, master)
 
-    def _query_master(self, dst_ia, src_ia=None, flags=0):
+    def _query_master(self, dst_ia, src_ia=None, flags=()):
         """
         Query master for a segment.
         """
@@ -213,7 +216,7 @@ class CorePathServer(PathServer):
                 continue
             cseg = csegs[0].get_path(reverse_direction=True)
             pkt = self._build_packet(SVCType.PS, dst_ia=isd_as, path=cseg,
-                                     payload=rep_recs)
+                                     payload=rep_recs.copy())
             self._send_to_next_hop(pkt, cseg.get_fwd_if())
 
     def path_resolution(self, pkt, new_request=True):
@@ -223,10 +226,10 @@ class CorePathServer(PathServer):
         pending request (False).
         Return True when resolution succeeded, False otherwise.
         """
-        seg_req = pkt.get_payload()
-        dst_ia = seg_req.dst_ia
+        req = pkt.get_payload()
+        dst_ia = req.dst_ia()
         if new_request:
-            logging.info("PATH_REQ received: %s", seg_req.short_desc())
+            logging.info("PATH_REQ received: %s", req.short_desc())
         if dst_ia == self.addr.isd_as:
             logging.warning("Dropping request: requested DST is local AS")
             return False
@@ -234,11 +237,11 @@ class CorePathServer(PathServer):
         dst_is_core = self.is_core_as(dst_ia) or dst_ia[1] == 0
         if dst_is_core:
             core_segs = self._resolve_core(pkt, dst_ia, new_request,
-                                           seg_req.flags)
+                                           req.flags())
             down_segs = set()
         else:
             core_segs, down_segs = self._resolve_not_core(
-                pkt, dst_ia, new_request, seg_req.flags)
+                pkt, dst_ia, new_request, req.flags())
 
         if not (core_segs | down_segs):
             if new_request:
@@ -256,7 +259,7 @@ class CorePathServer(PathServer):
         """
         Dst is core AS.
         """
-        sibra = bool(flags & PSF.SIBRA)
+        sibra = PATH_FLAG_SIBRA in flags
         params = {"last_ia": self.addr.isd_as}
         params["sibra"] = sibra
         params.update(dst_ia.params())
@@ -274,7 +277,7 @@ class CorePathServer(PathServer):
         Dst is regular AS.
         """
         seg_req = pkt.get_payload()
-        sibra = bool(flags & PSF.SIBRA)
+        sibra = PATH_FLAG_SIBRA in flags
         core_segs = set()
         down_segs = set()
         # Check if there exists any down-segs to dst.
@@ -283,9 +286,9 @@ class CorePathServer(PathServer):
             self._resolve_not_core_failed(pkt, dst_ia, flags)
 
         for dseg in tmp_down_segs:
-            dseg_ia = dseg.get_first_pcbm().isd_as
+            dseg_ia = dseg.first_ia()
             if (dseg_ia == self.addr.isd_as or
-                    seg_req.src_ia[0] != self.addr.isd_as[0]):
+                    seg_req.src_ia()[0] != self.addr.isd_as[0]):
                 # If it's a direct down-seg, or if it's a remote query, there's
                 # no need to include core-segs
                 down_segs.add(dseg)
@@ -310,7 +313,7 @@ class CorePathServer(PathServer):
         lack of corresponding down segment(s).
         This must not be executed for a pending request.
         """
-        sibra = bool(flags & PSF.SIBRA)
+        sibra = PATH_FLAG_SIBRA in flags
         self.pending_req[(dst_ia, sibra)].append(pkt)
         if dst_ia[0] == self.addr.isd_as[0]:
             # Master may know down segment as dst is in local ISD.
@@ -326,7 +329,7 @@ class CorePathServer(PathServer):
         if csegs:
             cseg = csegs[0]
             path = cseg.get_path(reverse_direction=True)
-            dst_ia = cseg.get_first_pcbm().isd_as
+            dst_ia = cseg.first_ia()
             req_pkt = self._build_packet(SVCType.PS, dst_ia=dst_ia,
                                          path=path, payload=seg_req)
             logging.info("Down-Segment request for different ISD, "

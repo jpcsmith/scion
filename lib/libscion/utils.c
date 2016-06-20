@@ -1,6 +1,7 @@
+#include <errno.h>
 #include <inttypes.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -41,7 +42,9 @@ void write_dp_header(uint8_t *buf, HostAddr *host, int packet_len)
 
 int send_dp_header(int sock, HostAddr *host, int packet_len)
 {
-    int addr_port_len = host->addr_len > 0 ? host->addr_len + 2 : 0;
+    int addr_port_len = 0;
+    if (host && host->addr_len > 0)
+        addr_port_len = host->addr_len + 2;
     uint8_t buf[DP_HEADER_LEN + addr_port_len];
     write_dp_header(buf, host, packet_len);
     return send_all(sock, buf, DP_HEADER_LEN + addr_port_len);
@@ -51,6 +54,7 @@ int recv_all(int sock, uint8_t *buf, int len)
 {
     int recvd = 0;
     while (recvd < len) {
+        errno = 0;
         int ret = recv(sock, buf + recvd, len - recvd, 0);
         if (ret < 0)
             return ret;
@@ -63,8 +67,10 @@ int recv_all(int sock, uint8_t *buf, int len)
 
 int send_all(int sock, uint8_t *buf, int len)
 {
+    errno = 0;
     int sent = 0;
     while (sent < len) {
+        errno = 0;
         int ret = send(sock, buf + sent, len - sent, 0);
         if (ret < 0)
             return ret;

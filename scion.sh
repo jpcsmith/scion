@@ -5,6 +5,7 @@ export PYTHONPATH=.
 # BEGIN subcommand functions
 
 cmd_topology() {
+    local zkclean
     if type -p supervisorctl &>/dev/null; then
         echo "Shutting down supervisord: $(supervisor/supervisor.sh shutdown)"
     fi
@@ -12,11 +13,15 @@ cmd_topology() {
     [ -e gen ] && rm -r gen
     if [ "$1" = "zkclean" ]; then
         shift
-        echo "Deleting all Zookeeper state"
-        tools/zkcleanslate
+        zkclean="y"
     fi
     echo "Create topology, configuration, and execution files."
     topology/generator.py "$@"
+    if [ -n "$zkclean" ]; then
+        echo "Deleting all Zookeeper state"
+        rm -rf /run/shm/scion-zk
+        tools/zkcleanslate --zk 127.0.0.1:2181
+    fi
 }
 
 cmd_run() {
@@ -26,7 +31,6 @@ cmd_run() {
     fi
     echo "Running the network..."
     bash gen/zk_datalog_dirs.sh || exit 1
-    supervisor/supervisor.sh quickstart dispatcher:dispatcher
     supervisor/supervisor.sh quickstart all
 }
 
@@ -55,7 +59,12 @@ cmd_coverage(){
 
 cmd_lint() {
     set -o pipefail
-    flake8 --config flake8.ini "${@:-.}" | sort -t: -k1,1 -k2n,2 -k3n,3
+    for i in . sub/web; do
+      [ -d "$i" ] || continue
+      echo "Linting $i"
+      echo "============================================="
+      (cd "$i" && flake8 --config flake8.ini . ) | sort -t: -k1,1 -k2n,2 -k3n,3
+    done
 }
 
 cmd_version() {
@@ -69,14 +78,14 @@ cmd_version() {
 
 cmd_build() {
     if [ "$1" == "bypass" ]; then
-        USER_OPTS=-DBYPASS_ROUTERS make all install
+        USER_OPTS=-DBYPASS_ROUTERS make -s all install
     else
-        make all install
+        make -s all install
     fi
 }
 
 cmd_clean() {
-    make clean
+    make -s clean
 }
 
 SOCKDIR=endhost/ssp
@@ -86,13 +95,18 @@ cmd_sock_cli() {
     then
         GENDIR=gen/ISD${1}/AS${2}/endhost
         ADDR="127.${1}.${2}.254"
+        ISD=${1}
+        AS=${2}
     else
         GENDIR=gen/ISD1/AS19/endhost
         ADDR="127.1.19.254"
+        ISD="1"
+        AS="19"
     fi
-    APIADDR="127.255.255.254"
+    # FIXME(aznair): Will become ISD_AS.sock in later PR
+    APIADDR="/run/shm/sciond/${ISD}-${AS}.sock"
     PYTHONPATH=.
-    python3 endhost/dummy.py $GENDIR $ADDR $APIADDR client
+    bin/sciond --addr $ADDR --api-addr $APIADDR sspclient $GENDIR
 }
 
 cmd_run_cli() {
@@ -105,13 +119,18 @@ cmd_sock_ser() {
     then
         GENDIR=gen/ISD${1}/AS${2}/endhost
         ADDR="127.${1}.${2}.254"
+        ISD=${1}
+        AS=${2}
     else
         GENDIR=gen/ISD2/AS26/endhost
         ADDR="127.2.26.254"
+        ISD="2"
+        AS="26"
     fi
-    APIADDR="127.255.255.253"
+    # FIXME(aznair): Will become ISD_AS.sock in later PR
+    APIADDR="/run/shm/sciond/${ISD}-${AS}.sock"
     PYTHONPATH=.
-    python3 endhost/dummy.py $GENDIR $ADDR $APIADDR server
+    bin/sciond --addr $ADDR --api-addr $APIADDR sspserver $GENDIR
 }
 
 cmd_run_ser() {

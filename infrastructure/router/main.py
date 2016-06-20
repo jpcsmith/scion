@@ -55,8 +55,9 @@ from lib.errors import (
 from lib.log import log_exception
 from lib.sibra.ext.ext import SibraExtBase
 from lib.packet.ext.traceroute import TracerouteExt
-from lib.packet.path_mgmt import IFStateRequest
-from lib.packet.scion import IFIDPayload, SVCType
+from lib.packet.ifid import IFIDPayload
+from lib.packet.path_mgmt.ifstate import IFStateInfo, IFStateRequest
+from lib.packet.scion import SVCType
 from lib.packet.scmp.errors import (
     SCMPBadExtOrder,
     SCMPBadHopByHop,
@@ -94,15 +95,6 @@ class Router(SCIONElement):
     """
     The SCION Router.
 
-    :ivar addr: the router address.
-    :type addr: :class:`SCIONAddr`
-    :ivar topology: the AS topology as seen by the router.
-    :type topology: :class:`Topology`
-    :ivar config: the configuration of the router.
-    :type config: :class:`Config`
-    :ivar dict ifid2addr:
-        a map from interface identifiers to the corresponding border router
-        addresses in the server's AS.
     :ivar interface: the router's inter-AS interface, if any.
     :type interface: :class:`lib.topology.InterfaceElement`
     """
@@ -140,8 +132,10 @@ class Router(SCIONElement):
             SibraExtBase.EXT_TYPE: False, TracerouteExt.EXT_TYPE: False,
             ExtHopByHopType.SCMP: False, HORNETPlugin.EXT_TYPE: False
         }
-        self.sibra_state = SibraState(self.interface.bandwidth,
-                                      self.addr.isd_as)
+        self.sibra_state = SibraState(
+            self.interface.bandwidth,
+            "%s#%s -> %s" % (self.addr.isd_as, self.interface.if_id,
+                             self.interface.isd_as))
         self.CTRL_PLD_CLASS_MAP = {
             PayloadClass.PCB: {PCBType.SEGMENT: self.process_pcb},
             PayloadClass.IFID: {IFIDType.PAYLOAD: self.process_ifid_request},
@@ -159,7 +153,7 @@ class Router(SCIONElement):
             bind=(str(self.interface.addr), self.interface.udp_port),
             addr_type=AddrType.IPV4,
         )
-        self._socks.add(self._remote_sock)
+        self._socks.add(self._remote_sock, self.handle_recv)
         logging.info("IP %s:%d", self.interface.addr, self.interface.udp_port)
 
     def _setup_socket(self, init=True):
@@ -173,7 +167,7 @@ class Router(SCIONElement):
             addr_type=self.addr.host.TYPE, reuse=True,
         )
         self._port = self._local_sock.port
-        self._socks.add(self._local_sock)
+        self._socks.add(self._local_sock, self.handle_recv)
 
     def run(self):
         """
@@ -185,6 +179,9 @@ class Router(SCIONElement):
         threading.Thread(
             target=thread_safety_net, args=(self.request_ifstates,),
             name="ER.request_ifstates", daemon=True).start()
+        threading.Thread(
+            target=thread_safety_net, args=(self.sibra_worker,),
+            name="ER.sibra_worker", daemon=True).start()
         SCIONElement.run(self)
 
     def send(self, spkt, addr=None, port=SCION_UDP_EH_DATA_PORT):
@@ -268,9 +265,9 @@ class Router(SCIONElement):
         neighboring router.
         """
         ifid_pld = IFIDPayload.from_values(self.interface.if_id)
-        pkt = self._build_packet(SVCType.BS, dst_ia=self.interface.isd_as,
-                                 payload=ifid_pld)
-        while True:
+        pkt = self._build_packet(SVCType.BS, dst_ia=self.interface.isd_as)
+        while self.run_flag.is_set():
+            pkt.set_payload(ifid_pld.copy())
             self.send(pkt, self.interface.to_addr, self.interface.to_udp_port)
             time.sleep(IFID_PKT_TOUT)
 
@@ -278,16 +275,23 @@ class Router(SCIONElement):
         """
         Periodically request interface states from the BS.
         """
-        ifstates_req = IFStateRequest.from_values()
-        req_pkt = self._build_packet(payload=ifstates_req)
-        while True:
+        pld = IFStateRequest.from_values()
+        req = self._build_packet()
+        while self.run_flag.is_set():
             start_time = SCIONTime.get_time()
             logging.info("Sending IFStateRequest for all interfaces.")
             for bs in self.topology.beacon_servers:
-                req_pkt.addrs.dst.host = bs.addr
-                self.send(req_pkt)
+                req.addrs.dst.host = bs.addr
+                req.set_payload(pld.copy())
+                self.send(req)
             sleep_interval(start_time, self.IFSTATE_REQ_INTERVAL,
                            "request_ifstates")
+
+    def sibra_worker(self):
+        while self.run_flag.is_set():
+            start_time = SCIONTime.get_time()
+            self.sibra_state.update_tick()
+            sleep_interval(start_time, 1.0, "sibra_worker")
 
     def process_ifid_request(self, pkt, from_local):
         """
@@ -302,16 +306,17 @@ class Router(SCIONElement):
             return
         if pkt.addrs.dst.host != SVCType.BS:
             raise SCMPBadHost("Invalid SVC address: %s", pkt.addrs.dst.host)
-        ifid_pld = pkt.get_payload()
+        ifid_pld = pkt.get_payload().copy()
         # Forward 'alive' packet to all BSes (to inform that neighbor is alive).
         # BS must determine interface.
-        ifid_pld.reply_id = self.interface.if_id
+        ifid_pld.p.relayIF = self.interface.if_id
         try:
             bs_addrs = self.dns_query_topo(BEACON_SERVICE)
         except SCIONServiceLookupError as e:
             logging.error("Unable to deliver ifid packet: %s", e)
             raise SCMPUnknownHost
         for bs_addr in bs_addrs:
+            pkt.set_payload(ifid_pld.copy())
             self.send(pkt, bs_addr)
 
     def get_srv_addr(self, service, pkt):
@@ -338,12 +343,12 @@ class Router(SCIONElement):
         """
         pcb = pkt.get_payload()
         if from_bs:
-            if self.interface.if_id != pcb.get_last_pcbm().hof.egress_if:
+            if self.interface.if_id != pcb.last_hof().egress_if:
                 logging.error("Wrong interface set by BS.")
                 return
             self.send(pkt, self.interface.to_addr, self.interface.to_udp_port)
         else:
-            pcb.if_id = self.interface.if_id
+            pcb.p.ifID = self.interface.if_id
             try:
                 bs_addr = self.get_srv_addr(BEACON_SERVICE, pkt)
             except SCIONServiceLookupError as e:
@@ -400,8 +405,8 @@ class Router(SCIONElement):
             # handle state update
             logging.debug("Received IFState update:\n%s",
                           str(mgmt_pkt.get_payload()))
-            for ifstate in payload.ifstate_infos:
-                self.if_states[ifstate.if_id].update(ifstate)
+            for p in payload.p.infos:
+                self.if_states[p.ifID].update(IFStateInfo(p))
             return
         self.handle_data(mgmt_pkt, from_local_as)
 
@@ -536,21 +541,27 @@ class Router(SCIONElement):
             logging.error("Dropping packet due to invalid header state.\n"
                           "Header:\n%s", spkt)
         except SCIONInterfaceDownException:
+            logging.debug("Dropping packet due to interface being down")
             pass
 
     def _process_data(self, spkt, ingress, drop_on_error):
         path = spkt.path
-        if len(spkt) > self.config.mtu:
+        if len(spkt) > self.topology.mtu:
             # FIXME(kormat): ignore this check for now, as PCB packets are often
             # over MTU, it's just that udp-overlay handles fragmentation for us.
             # Once we have TCP/SCION, this check should be re-instated.
-            #  raise SCMPOversizePkt
+            # This also needs to look at the specific MTU for the relevant link
+            # if on egress.
+            #  raise SCMPOversizePkt("Packet larger than mtu", mtu)
             pass
         self.verify_hof(path, ingress=ingress)
         hof = spkt.path.get_hof()
         if hof.verify_only:
             raise SCMPNonRoutingHOF
-        if spkt.addrs.dst.isd_as == self.addr.isd_as:
+        # FIXME(aznair): Remove second condition once PathCombinator is less
+        # stupid.
+        if (spkt.addrs.dst.isd_as == self.addr.isd_as and
+                spkt.path.is_on_last_segment()):
             self.deliver(spkt)
             return
         if ingress:
@@ -559,7 +570,7 @@ class Router(SCIONElement):
             fwd_if = path.get_fwd_if()
             path_incd = False
         try:
-            if_addr = self.ifid2addr[fwd_if]
+            if_addr = self.ifid2er[fwd_if].addr
         except KeyError:
             # So that the error message will show the current state of the
             # packet.
@@ -641,7 +652,7 @@ class Router(SCIONElement):
             logging.error("Extension asked to forward this to interface 0:\n%s",
                           pkt)
             return
-        next_hop = self.ifid2addr[ifid]
+        next_hop = self.ifid2er[ifid].addr
         logging.debug("Packet forwarded by extension via %s", next_hop)
         self.send(pkt, next_hop)
 
@@ -654,7 +665,7 @@ class Router(SCIONElement):
         logging.debug("Packet delivered by extension")
         self.deliver(pkt)
 
-    def handle_request(self, packet, _, from_local_socket=True):
+    def handle_request(self, packet, _, from_local_socket=True, sock=None):
         """
         Main routine to handle incoming SCION packets.
 

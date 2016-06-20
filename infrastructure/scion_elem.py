@@ -73,7 +73,7 @@ from lib.packet.scmp.errors import (
 )
 from lib.packet.scmp.types import SCMPClass
 from lib.packet.scmp.util import scmp_type_name
-from lib.socket import DispatcherSocket, SocketMgr
+from lib.socket import ReliableSocket, SocketMgr
 from lib.thread import thread_safety_net
 from lib.trust_store import TrustStore
 from lib.types import L4Proto, PayloadClass
@@ -98,9 +98,7 @@ class SCIONElement(object):
     :ivar `Topology` topology: the topology of the AS as seen by the server.
     :ivar `Config` config:
         the configuration of the AS in which the server is located.
-    :ivar dict ifid2addr:
-        a dictionary mapping interface identifiers to the corresponding border
-        router addresses in the server's AS.
+    :ivar dict ifid2er: map of interface ID to RouterElement.
     :ivar `SCIONAddr` addr: the server's address.
     """
     SERVICE_TYPE = None
@@ -118,7 +116,7 @@ class SCIONElement(object):
         """
         self.id = server_id
         self.conf_dir = conf_dir
-        self.ifid2addr = {}
+        self.ifid2er = {}
         self._port = port
         self.topology = Topology.from_file(
             os.path.join(self.conf_dir, TOPO_FILE))
@@ -135,14 +133,15 @@ class SCIONElement(object):
         self._dns = DNSCachingClient(
             [str(s.addr) for s in self.topology.dns_servers],
             self.topology.dns_domain)
-        self.construct_ifid2addr_map()
+        self.init_ifid2er()
         self.trust_store = TrustStore(self.conf_dir)
         self.total_dropped = 0
         self._core_ases = defaultdict(list)  # Mapping ISD_ID->list of core ASes
         self.init_core_ases()
         self.run_flag = threading.Event()
+        self.run_flag.set()
         self.stopped_flag = threading.Event()
-        self.stopped_flag.set()
+        self.stopped_flag.clear()
         self._in_buf = queue.Queue(MAX_QUEUE)
         self._socks = SocketMgr()
         self._setup_socket(True)
@@ -153,21 +152,17 @@ class SCIONElement(object):
         Setup incoming socket and register with dispatcher
         """
         svc = SVC_TYPE_MAP.get(self.SERVICE_TYPE)
-        self._local_sock = DispatcherSocket(self.addr, self._port, init, svc)
+        self._local_sock = ReliableSocket(
+            reg=(self.addr, self._port, init, svc))
         if not self._local_sock.registered:
             self._local_sock = None
             return
         self._port = self._local_sock.port
-        self._socks.add(self._local_sock)
+        self._socks.add(self._local_sock, self.handle_recv)
 
-    def construct_ifid2addr_map(self):
-        """
-        Construct the mapping between the local interface IDs and the address
-        of the neighbors connected to those interfaces.
-        """
-        assert self.topology is not None
-        for edge_router in self.topology.get_all_edge_routers():
-            self.ifid2addr[edge_router.interface.if_id] = edge_router.addr
+    def init_ifid2er(self):
+        for er in self.topology.get_all_edge_routers():
+            self.ifid2er[er.interface.if_id] = er
 
     def init_core_ases(self):
         """
@@ -179,7 +174,7 @@ class SCIONElement(object):
     def is_core_as(self, isd_as):
         return isd_as in self._core_ases[isd_as[0]]
 
-    def handle_request(self, packet, sender, from_local_socket=True):
+    def handle_request(self, packet, sender, from_local_socket=True, sock=None):
         """
         Main routine to handle incoming SCION packets. Subclasses may
         override this to provide their own functionality.
@@ -290,7 +285,7 @@ class SCIONElement(object):
             if isinstance(e, SCMPUnspecified):
                 args = (str(e),)
             elif isinstance(e, (SCMPOversizePkt, SCMPBadPktLen)):
-                args = (self.config.mtu,)
+                args = (e.args[1],)  # the relevant MTU.
             elif isinstance(e, (SCMPTooManyHopByHop, SCMPBadExtOrder,
                                 SCMPBadHopByHop)):
                 args = e.args
@@ -340,9 +335,9 @@ class SCIONElement(object):
             if len(spkt.path) == 0:
                 return self._empty_first_hop(spkt)
             if_id = spkt.path.get_fwd_if()
-        if if_id in self.ifid2addr:
-            return self.ifid2addr[if_id], SCION_UDP_EH_DATA_PORT
-        logging.error("Unable to find first hop")
+        if if_id in self.ifid2er:
+            return self.ifid2er[if_id].addr, SCION_UDP_EH_DATA_PORT
+        logging.error("Unable to find first hop:\n", spkt.path)
         return None, None
 
     def _ext_first_hop(self, spkt):
@@ -354,6 +349,7 @@ class SCIONElement(object):
     def _empty_first_hop(self, spkt):
         if spkt.addrs.src.isd_as != spkt.addrs.dst.isd_as:
             logging.error("Packet has no path but different src/dst ASes")
+            logging.error(spkt)
             return None, None
         return spkt.addrs.dst.host, SCION_UDP_EH_DATA_PORT
 
@@ -370,7 +366,7 @@ class SCIONElement(object):
         dst_addr = SCIONAddr.from_values(dst_ia, dst_host)
         cmn_hdr, addr_hdr = build_base_hdrs(self.addr, dst_addr)
         udp_hdr = SCIONUDPHeader.from_values(
-            self.addr, self._port, dst_addr, dst_port, payload)
+            self.addr, self._port, dst_addr, dst_port)
         return SCIONL4Packet.from_values(
             cmn_hdr, addr_hdr, path, ext_hdrs, udp_hdr, payload)
 
@@ -396,23 +392,25 @@ class SCIONElement(object):
         Main routine to receive packets and pass them to
         :func:`handle_request()`.
         """
-        self.stopped_flag.clear()
-        self.run_flag.set()
         threading.Thread(
             target=thread_safety_net, args=(self.packet_recv,),
             name="Elem.packet_recv", daemon=True).start()
+        try:
+            self._packet_process()
+        finally:
+            self.stop()
 
-        self._packet_process()
-
-    def packet_put(self, packet, addr, from_local_as):
+    def packet_put(self, packet, addr, sock):
         """
         Try to put incoming packet in queue
         If queue is full, drop oldest packet in queue
         """
+        from_local_as = sock == self._local_sock
         dropped = 0
         while True:
             try:
-                self._in_buf.put((packet, addr, from_local_as), block=False)
+                self._in_buf.put((packet, addr, from_local_as, sock),
+                                 block=False)
             except queue.Full:
                 self._in_buf.get_nowait()
                 dropped += 1
@@ -423,6 +421,29 @@ class SCIONElement(object):
             logging.debug("%d packet(s) dropped (%d total dropped so far)",
                           dropped, self.total_dropped)
 
+    def handle_accept(self, sock):
+        """
+        Callback to handle a ready listening socket
+        """
+        s = sock.accept()
+        if not s:
+            logging.error("accept failed")
+            return
+        self._socks.add(s, self.handle_recv)
+
+    def handle_recv(self, sock):
+        """
+        Callback to handle a ready recving socket
+        """
+        packet, addr = sock.recv()
+        if packet is None:
+            self._socks.remove(sock)
+            sock.close()
+            if sock == self._local_sock:
+                self._local_sock = None
+            return
+        self.packet_put(packet, addr, sock)
+
     def packet_recv(self):
         """
         Read packets from sockets, and put them into a :class:`queue.Queue`.
@@ -430,23 +451,9 @@ class SCIONElement(object):
         while self.run_flag.is_set():
             if not self._local_sock:
                 self._setup_socket(False)
-            for sock in self._socks.select_(timeout=1.0):
-                while True:
-                    try:
-                        # Read from socket until its buffer is empty.
-                        packet, addr = sock.recv(block=False)
-                    except BlockingIOError:
-                        break
-                    else:
-                        if (sock == self._local_sock and
-                                isinstance(sock, DispatcherSocket) and
-                                packet is None):
-                            self._socks.remove(self._local_sock)
-                            self._local_sock.close()
-                            self._local_sock = None
-                            break
-                        self.packet_put(packet, addr, sock == self._local_sock)
-
+            for sock, callback in self._socks.select_(timeout=1.0):
+                callback(sock)
+        self._socks.close()
         self.stopped_flag.set()
 
     def _packet_process(self):
@@ -460,14 +467,11 @@ class SCIONElement(object):
                 continue
 
     def stop(self):
-        """
-        Shut down the daemon thread
-        """
+        """Shut down the daemon thread."""
         # Signal that the thread should stop
         self.run_flag.clear()
-        self._socks.close()
         # Wait for the thread to finish
-        self.stopped_flag.wait()
+        self.stopped_flag.wait(5)
 
     def _quiet_startup(self):
         return (time.time() - self._startup) < self.STARTUP_QUIET_PERIOD

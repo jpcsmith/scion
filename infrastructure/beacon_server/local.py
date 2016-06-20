@@ -22,7 +22,7 @@ import logging
 from infrastructure.beacon_server.base import BeaconServer
 from lib.defines import PATH_SERVICE, SIBRA_SERVICE
 from lib.errors import SCIONKeyError, SCIONParseError, SCIONServiceLookupError
-from lib.packet.path_mgmt import PathRecordsReg
+from lib.packet.path_mgmt.seg_recs import PathRecordsReg
 from lib.packet.pcb import PathSegment
 from lib.packet.scion import SVCType
 from lib.path_store import PathStore
@@ -76,7 +76,7 @@ class LocalBeaconServer(BeaconServer):
         """
         records = PathRecordsReg.from_values({PST.UP: [pcb]})
         ps_host = self.dns_query_topo(PATH_SERVICE)[0]
-        pkt = self._build_packet(ps_host, payload=records)
+        pkt = self._build_packet(ps_host, payload=records.copy())
         self.send(pkt, ps_host)
         sb_host = self.dns_query_topo(SIBRA_SERVICE)[0]
         pkt = self._build_packet(sb_host, payload=records)
@@ -88,15 +88,15 @@ class LocalBeaconServer(BeaconServer):
         """
         core_path = pcb.get_path(reverse_direction=True)
         records = PathRecordsReg.from_values({PST.DOWN: [pcb]})
-        dst_ia = pcb.get_first_pcbm().isd_as
+        dst_ia = pcb.asm(0).isd_as()
         pkt = self._build_packet(SVCType.PS, dst_ia=dst_ia, path=core_path,
                                  payload=records)
         fwd_if = core_path.get_fwd_if()
-        if fwd_if not in self.ifid2addr:
+        if fwd_if not in self.ifid2er:
             raise SCIONKeyError(
                 "Invalid IF %d in CorePath" % fwd_if)
 
-        next_hop = self.ifid2addr[fwd_if]
+        next_hop = self.ifid2er[fwd_if].addr
         self.send(pkt, next_hop)
 
     def register_segments(self):
@@ -113,7 +113,7 @@ class LocalBeaconServer(BeaconServer):
         for pcb in pcbs:
             if raw:
                 try:
-                    pcb = PathSegment(pcb)
+                    pcb = PathSegment.from_raw(pcb)
                 except SCIONParseError as e:
                     logging.error("Unable to parse raw pcb: %s", e)
                     continue
@@ -169,7 +169,7 @@ class LocalBeaconServer(BeaconServer):
         for pcb in best_segments:
             pcb = self._terminate_pcb(pcb)
             pcb.remove_crypto()
-            self._sign_beacon(pcb)
+            pcb.sign(self.signing_key)
             try:
                 self.register_up_segment(pcb)
             except SCIONServiceLookupError as e:
@@ -185,6 +185,6 @@ class LocalBeaconServer(BeaconServer):
         for pcb in best_segments:
             pcb = self._terminate_pcb(pcb)
             pcb.remove_crypto()
-            self._sign_beacon(pcb)
+            pcb.sign(self.signing_key)
             self.register_down_segment(pcb)
             logging.info("Down path registered: %s", pcb.short_desc())

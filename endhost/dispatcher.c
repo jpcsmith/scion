@@ -121,6 +121,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, handle_signal);
     signal(SIGQUIT, handle_signal);
     signal(SIGINT, handle_signal);
+    signal(SIGPIPE, handle_signal);
 
     struct rlimit rl;
     int res;
@@ -166,11 +167,16 @@ int main(int argc, char **argv)
 void handle_signal(int sig)
 {
     switch (sig) {
+        case SIGPIPE:
+            zlog_debug(zc, "Broken pipe");
+            break;
         case SIGTERM:
             zlog_info(zc, "Received SIGTERM");
+            unlink(SCION_DISPATCHER_ADDR);
             exit(0);
         default:
             zlog_info(zc, "Received signal %d", sig);
+            unlink(SCION_DISPATCHER_ADDR);
             exit(1);
     }
 }
@@ -234,7 +240,6 @@ int bind_app_socket()
     memset(&su, 0, sizeof(su));
     su.sun_family = AF_UNIX;
     strcpy(su.sun_path, SCION_DISPATCHER_ADDR);
-    unlink(su.sun_path);
     if (bind(app_socket, (struct sockaddr *)&su, sizeof(su)) < 0) {
         zlog_fatal(zc, "failed to bind app socket to %s", su.sun_path);
         return -1;
@@ -359,7 +364,7 @@ void register_ssp(uint8_t *buf, int len, sockaddr_in *addr, int sock)
         HASH_FIND(hh, ssp_flow_list, &e->l4_key, sizeof(L4Key), old);
         if (old) {
             zlog_error(zc, "address-flow already registered");
-            reply(sock, 0);
+            reply(sock, 1);
             return;
         }
         e->list = &ssp_flow_list;
@@ -400,7 +405,7 @@ Entry * parse_request(uint8_t *buf, int len, int proto, sockaddr_in *addr, int s
     uint16_t port = ntohs(*(uint16_t *)(buf + 6));
     int common = 9; // start of (protocol/addrtype)-dependent data
 
-    zlog_info(zc, "registration for isd_as %x(%d,%d)", isd_as, ISD(isd_as), AS(isd_as));
+    zlog_info(zc, "registration for isd_as %x(%d-%d)", isd_as, ISD(isd_as), AS(isd_as));
 
     Entry *e = (Entry *)malloc(sizeof(Entry));
     if (!e) {
@@ -434,15 +439,15 @@ Entry * parse_request(uint8_t *buf, int len, int proto, sockaddr_in *addr, int s
         e->l4_key.isd_as = isd_as;
         memcpy(e->l4_key.host, buf + common + 8, addr_len);
         end = addr_len + common + 8;
+        zlog_info(zc, "registration for %s:%d:%" PRIu64,
+                inet_ntoa(*(struct in_addr *)e->l4_key.host), e->l4_key.port, e->l4_key.flow_id);
     } else if (proto == L4_UDP) {
     /* command (1B) | proto (1B) | isd_as (4B) | port (2B) | addr type (1B) | addr (?B) | SVC (2B, optional) */
         e->l4_key.port = port;
         e->l4_key.isd_as = isd_as;
         memcpy(e->l4_key.host, buf + common, addr_len);
         end = addr_len + common;
-        sockaddr_in reg_addr;
-        memcpy(&reg_addr.sin_addr, e->l4_key.host, addr_len);
-        zlog_info(zc, "registration for %s:%d", inet_ntoa(reg_addr.sin_addr), e->l4_key.port);
+        zlog_info(zc, "registration for %s:%d", inet_ntoa(*(struct in_addr *)e->l4_key.host), e->l4_key.port);
     }
     if (IS_SCMP_REQ(*buf))
         e->scmp = 1;
@@ -573,7 +578,7 @@ void handle_data()
     uint8_t l4 = get_l4_proto(&l4ptr);
     switch (l4) {
         case L4_SCMP:
-            fprintf(stderr, "incoming scmp packet for %s\n", inet_ntoa(dst.sin_addr));
+            zlog_debug(zc, "incoming scmp packet for %s\n", inet_ntoa(dst.sin_addr));
             process_scmp(buf, (SCMPL4Header *)l4ptr, len, &src_si);
             break;
         case L4_SSP:
@@ -592,23 +597,27 @@ void deliver_ssp(uint8_t *buf, uint8_t *l4ptr, int len, HostAddr *from)
     Entry *e;
     L4Key key;
     memset(&key, 0, sizeof(key));
-    key.flow_id = be64toh(*(uint64_t *)l4ptr);
-    key.port = 0;
+    key.port = ntohs(*(uint16_t *)(l4ptr + 8));
     key.isd_as = ntohl(*(uint32_t *)(dst_ptr - ISD_AS_LEN));
     memcpy(key.host, dst_ptr, dst_len);
-    HASH_FIND(hh, ssp_flow_list, &key, sizeof(key), e);
-    if (!e) {
-        zlog_warn(zc, "no flow entry found for %" PRIu64, key.flow_id);
-        key.flow_id = 0;
-        key.port = ntohs(*(uint16_t *)(l4ptr + 8));
+    if (key.port != 0) {
         HASH_FIND(hh, ssp_wildcard_list, &key, sizeof(key), e);
         if (!e) {
-            zlog_warn(zc, "no wildcard entry found for %d", key.port);
+            zlog_warn(zc, "no wildcard entry found for port %d at (%d-%d):%s",
+                    key.port, ISD(key.isd_as), AS(key.isd_as), inet_ntoa(*(struct in_addr *)key.host));
+            return;
+        }
+    } else {
+        key.flow_id = be64toh(*(uint64_t *)l4ptr);
+        HASH_FIND(hh, ssp_flow_list, &key, sizeof(key), e);
+        if (!e) {
+            zlog_warn(zc, "no flow entry found for (%d-%d):%s:%" PRIu64,
+                    ISD(key.isd_as), AS(key.isd_as), inet_ntoa(*(struct in_addr *)key.host), key.flow_id);
             return;
         }
     }
     zlog_debug(zc, "incoming ssp packet for %s:%d:%" PRIu64, 
-            inet_ntoa(*(struct in_addr *)dst_ptr), key.port, key.flow_id);
+               inet_ntoa(*(struct in_addr *)dst_ptr), key.port, key.flow_id);
     send_dp_header(e->sock, from, len);
     send_all(e->sock, buf, len);
 }
@@ -644,6 +653,8 @@ void deliver_udp(uint8_t *buf, int len, HostAddr *from, sockaddr_in *dst)
             return;
         }
         sock = se->sockets[rand() % se->count];
+        zlog_debug(zc, "deliver UDP packet to (%d-%d):%s",
+                ISD(svc_key.isd_as), AS(svc_key.isd_as), inet_ntoa(dst->sin_addr));
     } else {
         L4Key key;
         memset(&key, 0, sizeof(key));
@@ -669,7 +680,7 @@ void process_scmp(uint8_t *buf, SCMPL4Header *scmp, int len, sockaddr_in *from)
 {
     int calc_chk = scmp_checksum(buf);
     if (calc_chk != scmp->checksum) {
-        fprintf(stderr, "SCMP header checksum (%x) doesn't match computed checksum (%x)\n",
+        zlog_error(zc, "SCMP header checksum (%x) doesn't match computed checksum (%x)\n",
                 scmp->checksum, calc_chk);
         return;
     }
@@ -687,7 +698,7 @@ void send_scmp_echo_reply(uint8_t *buf, SCMPL4Header *scmp, sockaddr_in *from)
     scmp->type = htons(SCMP_ECHO_REPLY);
     update_scmp_checksum(buf);
     from->sin_port = htons(SCION_UDP_EH_DATA_PORT);
-    fprintf(stderr, "send echo reply to %s:%d\n", inet_ntoa(from->sin_addr), ntohs(from->sin_port));
+    zlog_debug(zc, "send echo reply to %s:%d\n", inet_ntoa(from->sin_addr), ntohs(from->sin_port));
     sendto(data_socket, buf, ntohs(sch->total_len), 0,
             (struct sockaddr *)from, sizeof(sockaddr_in));
 }
@@ -697,12 +708,12 @@ void deliver_scmp(uint8_t *buf, SCMPL4Header *scmp, int len, sockaddr_in *from)
     SCMPPayload *pld;
     pld = scmp_parse_payload(scmp);
     if (pld->meta->l4_proto != L4_UDP && pld->meta->l4_proto != L4_NONE) {
-        fprintf(stderr, "SCMP not supported for protocol %d\n", pld->meta->l4_proto);
+        zlog_error(zc, "SCMP not supported for protocol %d\n", pld->meta->l4_proto);
         return;
     }
     SCIONCommonHeader *sch = pld->cmnhdr;
     if (SRC_TYPE(sch) == ADDR_SVC_TYPE) {
-        fprintf(stderr, "SCMP does not support SVC source.\n");
+        zlog_error(zc, "SCMP does not support SVC source.\n");
         return;
     }
     L4Key key;
@@ -715,11 +726,11 @@ void deliver_scmp(uint8_t *buf, SCMPL4Header *scmp, int len, sockaddr_in *from)
     Entry *e;
     HASH_FIND(hh, udp_port_list, &key, sizeof(key), e);
     if (!e) {
-        fprintf(stderr, "entry for %s:%d not found\n",
+        zlog_error(zc, "entry for %s:%d not found\n",
                 inet_ntoa(*(struct in_addr *)(key.host)), key.port);
         return;
     }
-    fprintf(stderr, "entry for %s:%d found\n",
+    zlog_debug(zc, "entry for %s:%d found\n",
             inet_ntoa(*(struct in_addr *)(key.host)), key.port);
 
     HostAddr host;
@@ -737,12 +748,10 @@ void handle_send(int index)
     int res;
     int sock = sockets[index].fd;
 
-    zlog_debug(zc, "handle_send on socket %d (fd %d)", index, sock);
     /*
      * Application message format:
      * cookie (8B) | addr_len (1B) | packet_len (4B) | addr (?B) | port (2B) | msg (?B)
      * addr and port denote first hop for outgoing packets
-     * if addr_len == 0, addr and port fields are omitted
      */
     res = recv_all(sock, buf, DP_HEADER_LEN);
     if (res <= 0) {
@@ -750,19 +759,14 @@ void handle_send(int index)
         return;
     }
 
-    zlog_debug(zc, "%d bytes on socket %d (fd %d)", res, index, sock);
     int addr_len, packet_len;
     parse_dp_header(buf, &addr_len, &packet_len);
     if (packet_len < 0 || addr_len == 0) {
-        zlog_error(zc, "invalid header sent from app - Cookie:");
-        int i;
-        for (i = 0; i < 8; i++)
-            zlog_error(zc, "byte %d: %x", i, buf[i]);
+        zlog_error(zc, "invalid header sent from app - Cookie: %" PRIx64, *(uint64_t *)buf);
         zlog_error(zc, "addr_len = %d, packet_len = %d", addr_len, packet_len);
         cleanup_socket(sock, index, EIO);
         return;
     }
-    zlog_debug(zc, "fd %d: read in %d total bytes", sock, packet_len);
     if (recv_all(sock, buf, addr_len + 2 + packet_len) < 0) {
         zlog_error(zc, "error reading from application");
         cleanup_socket(sock, index, errno);
@@ -775,7 +779,9 @@ void handle_send(int index)
     memcpy(&hop.sin_addr, buf, addr_len);
     hop.sin_port = htons(*(uint16_t *)(buf + addr_len));
     sendto(data_socket, buf + addr_len + 2, packet_len, 0, (struct sockaddr *)&hop, sizeof(hop));
-    zlog_debug(zc, "packet sent to %s:%d", inet_ntoa(hop.sin_addr), ntohs(hop.sin_port));
+    uint8_t *l4ptr = buf + addr_len + 2;
+    uint8_t l4 = get_l4_proto(&l4ptr);
+    zlog_debug(zc, "packet (l4 = %d) sent to %s:%d", l4, inet_ntoa(hop.sin_addr), ntohs(hop.sin_port));
 }
 
 void cleanup_socket(int sock, int index, int err)

@@ -22,8 +22,19 @@ import errno
 import logging
 import os
 import struct
-from ctypes import (addressof, byref, CDLL, c_int, c_short, c_size_t,
-                    c_ubyte, c_uint, c_void_p, Structure)
+from ctypes import (
+    addressof,
+    byref,
+    CDLL,
+    c_double,
+    c_int,
+    c_short,
+    c_size_t,
+    c_ubyte,
+    c_uint,
+    c_void_p,
+    Structure,
+)
 
 # SCION
 from lib.packet.scion_addr import ISD_AS
@@ -32,6 +43,7 @@ from lib.util import Raw
 ByteArray16 = c_ubyte * 16
 MAX_PATHS = 20
 MAX_OPTION_LEN = 20
+SHARED_LIB_FILE = os.path.join("endhost", "ssp", "libssocket.so")
 
 
 class C_HostAddr(Structure):
@@ -208,10 +220,6 @@ class ScionStats(object):
         return "\n".join(result)
 
 
-SHARED_LIB_LOCATION = os.path.join("endhost", "ssp")
-SHARED_LIB_SERVER = "libserver.so"
-SHARED_LIB_CLIENT = "libclient.so"
-
 # Slightly more than enough for 20 paths with 20 IFs each
 MAX_STATS_BUFFER = 3072
 # Socket Option codes
@@ -255,24 +263,26 @@ class ScionBaseSocket(object):
     # map option to minimum data length for that option
     LONG_OPTIONS = {SCION_OPTION_ISD_WLIST: 0}
 
-    def __init__(self, proto, libsock, fd=None):
+    def __init__(self, proto, sciond_addr, libssock, fd=None):
         """
-        This class can be used if the fd and libsock are known in
+        This class can be used if the fd and libssock are known in
         advance. See accept() in ScionServerSocket for an example
         usage.
         :param proto: Protocol number to use for socket
         :type proto: int
-        :param libsock: The relevant SCION Multi-Path Socket library.
+        :param libssock: The relevant SCION Multi-Path Socket library.
         :type: Dynamically loaded shared library (.so).
         :param fd: Underlying file descriptor of the socket.
         :type fd: int
         """
         self.proto = proto
-        self.libsock = libsock
+        self.libssock = libssock
+        self.sciond_addr = sciond_addr
+        self.port = 0
         if fd:
             self.fd = fd
         else:
-            self.fd = self.libsock.newSCIONSocket(self.proto)
+            self.fd = self.libssock.newSCIONSocket(self.proto, sciond_addr)
 
     def bind(self, port, saddr=None):
         """
@@ -286,7 +296,8 @@ class ScionBaseSocket(object):
         :rtype: int
         """
         sa = addr_py2c(saddr, port)
-        return self.libsock.SCIONBind(self.fd, sa)
+        self.port = port
+        return self.libssock.SCIONBind(self.fd, sa)
 
     def send(self, msg):
         """
@@ -304,7 +315,7 @@ class ScionBaseSocket(object):
             return 0
         if msg is None or len(msg) == 0:
             return 0
-        return self.libsock.SCIONSend(self.fd, msg, len(msg))
+        return self.libssock.SCIONSend(self.fd, msg, len(msg), 0)
 
     def sendall(self, msg):
         """
@@ -332,16 +343,33 @@ class ScionBaseSocket(object):
             logging.critical("Called recv after close")
             return None
         buf = (c_ubyte * bufsize)()
-        num_bytes_rcvd = self.libsock.SCIONRecv(self.fd, byref(buf),
-                                                bufsize, None)
+        num_bytes_rcvd = self.libssock.SCIONRecv(
+            self.fd, byref(buf), bufsize, None)
         if num_bytes_rcvd < 0:
             logging.error("Error during recv.")
             return None
         elif num_bytes_rcvd == 0:
-            logging.warning("Received 0 bytes on fd %d. Is the socket closed?"
-                            % self.fd)
-
+            logging.debug("Received 0 bytes on fd %d - remote socket closed",
+                          self.fd)
         return bytes(buf[:num_bytes_rcvd])
+
+    def recv_all(self, total):
+        """
+        Repeatedly call recv until total bytes are read.
+        :param total: Total size to read from socket.
+        :type total: int
+        """
+        barr = bytearray()
+        while len(barr) < total:
+            buf = self.recv(total - len(barr))
+            if not buf:
+                if len(barr) > 0:
+                    logging.error("Connection prematurely terminated")
+                else:
+                    logging.debug("Connection terminated")
+                return None
+            barr += buf
+        return barr
 
     def fileno(self):
         """
@@ -359,9 +387,9 @@ class ScionBaseSocket(object):
         :returns: Python class containing socket traffic data
         :rtype: ScionStats
         """
-        self.libsock.SCIONGetStats.restype = c_int
+        self.libssock.SCIONGetStats.restype = c_int
         buf = bytes(MAX_STATS_BUFFER)
-        stats_len = self.libsock.SCIONGetStats(self.fd, buf, MAX_STATS_BUFFER)
+        stats_len = self.libssock.SCIONGetStats(self.fd, buf, MAX_STATS_BUFFER)
         if not stats_len:
             return None
         py_stats = ScionStats(buf[:stats_len])
@@ -379,7 +407,7 @@ class ScionBaseSocket(object):
         :returns: 0 on success, error code on failure (EPERM, EINVAL)
         :rtype: int
         """
-        self.libsock.SCIONSetOption.argtypes = (c_int, c_void_p,)
+        self.libssock.SCIONSetOption.argtypes = (c_int, c_void_p,)
         opt = C_SCIONOption()
         opt.type = opttype
         if data is not None:
@@ -394,7 +422,7 @@ class ScionBaseSocket(object):
             opt.data = 0
             opt.len = 0
             opt.val = val
-        return self.libsock.SCIONSetOption(self.fd, addressof(opt))
+        return self.libssock.SCIONSetOption(self.fd, addressof(opt))
 
     def getopt(self, opttype):
         """
@@ -404,7 +432,7 @@ class ScionBaseSocket(object):
         :returns: Current option value
         :rtype: bytes object (length will depend on option type)
         """
-        self.libsock.SCIONGetOption.argtypes = (c_int, c_void_p,)
+        self.libssock.SCIONGetOption.argtypes = (c_int, c_void_p,)
         opt = C_SCIONOption()
         opt.type = opttype
         buf = None
@@ -412,8 +440,7 @@ class ScionBaseSocket(object):
             buf = bytes(self.LONG_OPTIONS[opttype])
             opt.data = buf
             opt.len = len(buf)
-        logging.debug("opt addr = %x", addressof(opt))
-        self.libsock.SCIONGetOption(self.fd, addressof(opt))
+        self.libssock.SCIONGetOption(self.fd, addressof(opt))
         if opttype in self.LONG_OPTIONS:
             return buf
         else:
@@ -425,7 +452,7 @@ class ScionBaseSocket(object):
         :returns: Local ISD_AS, 0 on failure
         :rtype: int
         """
-        return self.libsock.SCIONGetLocalIA(self.fd)
+        return self.libssock.SCIONGetLocalIA(self.fd)
 
     def shutdown(self, how):
         """
@@ -439,13 +466,13 @@ class ScionBaseSocket(object):
         :param how: Not implemented yet, placeholder for compatibility
         :type how: int
         """
-        self.libsock.SCIONShutdown(self.fd)
+        self.libssock.SCIONShutdown(self.fd)
 
     def close(self):
         """
         Destroys underlying socket object and free associated resources.
         """
-        self.libsock.deleteSCIONSocket(self.fd)
+        self.libssock.deleteSCIONSocket(self.fd)
         self.fd = -1
 
     def is_alive(self):
@@ -454,13 +481,19 @@ class ScionBaseSocket(object):
         """
         return self.fd != -1
 
+    def settimeout(self, timeout):
+        """
+        Set timeout for socket operations connect/send/recv
+        """
+        self.libssock.SCIONSetTimeout(self.fd, c_double(timeout))
+
 
 class ScionServerSocket(ScionBaseSocket):
     """
     Server side wrapper of the SCION Multi-Path Socket.
     """
 
-    def __init__(self, proto):
+    def __init__(self, proto, sciond_addr):
         """
         :param proto: The type of SCION socket protocol to be used
         (see lib/defines).
@@ -468,9 +501,8 @@ class ScionServerSocket(ScionBaseSocket):
         :param server_port: The port number that the server will listen on.
         :type server_port: int
         """
-        super().__init__(proto, CDLL(os.path.join(SHARED_LIB_LOCATION,
-                                                  SHARED_LIB_SERVER)))
-        logging.info("ScionServerSocket fd = %d" % self.fd)
+        super().__init__(proto, sciond_addr, CDLL(SHARED_LIB_FILE))
+        logging.debug("ScionServerSocket fd = %d" % self.fd)
 
     def listen(self):
         """
@@ -478,7 +510,7 @@ class ScionServerSocket(ScionBaseSocket):
         :returns: 0 on success, -1 on failure
         :rtype: int
         """
-        return self.libsock.SCIONListen(self.fd)
+        return self.libssock.SCIONListen(self.fd)
 
     def accept(self):
         """
@@ -491,16 +523,17 @@ class ScionServerSocket(ScionBaseSocket):
         connection.
         :rtype: Address tuple (ScionBaseSocket, Address)
         """
-        newfd = self.libsock.SCIONAccept(self.fd)
-        logging.info("Accepted socket %d" % newfd)
-        return ScionBaseSocket(self.proto, self.libsock, newfd), None
+        newfd = self.libssock.SCIONAccept(self.fd)
+        logging.debug("Accepted socket %d" % newfd)
+        return ScionBaseSocket(self.proto, self.sciond_addr,
+                               self.libssock, newfd), None
 
 
 class ScionClientSocket(ScionBaseSocket):
     """
     Client side wrapper of the SCION Multi-Path Socket.
     """
-    def __init__(self, proto):
+    def __init__(self, proto, sciond_addr):
         """
         :param proto: The type of SCION socket protocol to be used
         (see lib/defines).
@@ -509,9 +542,8 @@ class ScionClientSocket(ScionBaseSocket):
         :param target_address: The address of the server to connect to.
         :type target_address: (string, int) tuple
         """
-        super().__init__(proto, CDLL(os.path.join(SHARED_LIB_LOCATION,
-                                                  SHARED_LIB_CLIENT)))
-        logging.info("ScionClientSocket fd = %d" % self.fd)
+        super().__init__(proto, sciond_addr, CDLL(SHARED_LIB_FILE))
+        logging.debug("ScionClientSocket fd = %d" % self.fd)
 
     def connect(self, saddr, port):
         """
@@ -524,4 +556,4 @@ class ScionClientSocket(ScionBaseSocket):
         :rtype: int
         """
         sa = addr_py2c(saddr, port)
-        return self.libsock.SCIONConnect(self.fd, sa)
+        return self.libssock.SCIONConnect(self.fd, sa)

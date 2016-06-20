@@ -4,9 +4,11 @@ dnslib
 dnspython3
 flake8
 kazoo
+lz4
 nose
 nose-cov
 nose-descriptionfixer
+pycapnp
 pycrypto
 pydblite
 pygments

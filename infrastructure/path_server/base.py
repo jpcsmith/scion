@@ -28,18 +28,13 @@ from external.expiring_dict import ExpiringDict
 # SCION
 from infrastructure.scion_elem import SCIONElement
 from lib.defines import PATH_SERVICE, SCION_UDP_PORT
-from lib.errors import SCIONParseError
-from lib.log import log_exception
-from lib.packet.path_mgmt import (
-    PathRecordsReply,
-    RevocationInfo,
-)
-from lib.packet.pcb import PathSegment
+from lib.packet.path_mgmt.rev_info import RevocationInfo
+from lib.packet.path_mgmt.seg_recs import PathRecordsReply, PathSegmentRecords
 from lib.packet.scion import SVCType
 from lib.path_db import DBResult, PathSegmentDB
 from lib.thread import thread_safety_net
 from lib.types import PathMgmtType as PMT, PathSegmentType as PST, PayloadClass
-from lib.util import Raw, SCIONTime, sleep_interval
+from lib.util import SCIONTime, sleep_interval
 from lib.zookeeper import ZkNoConnection, ZkSharedCache, Zookeeper
 
 
@@ -97,7 +92,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         """
         worker_cycle = 1.0
         start = SCIONTime.get_time()
-        while True:
+        while self.run_flag.is_set():
             sleep_interval(start, worker_cycle, "cPS.worker cycle",
                            self._quiet_startup())
             start = SCIONTime.get_time()
@@ -120,16 +115,8 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         """
         count = 0
         for raw in raw_entries:
-            data = Raw(raw)
-            while data:
-                type_ = data.pop(1)
-                try:
-                    pcb = PathSegment(data.get())
-                except SCIONParseError:
-                    log_exception("Error parsing cached pcb",
-                                  level=logging.ERROR)
-                    continue
-                data.pop(len(pcb))
+            recs = PathSegmentRecords.from_raw(raw)
+            for type_, pcb in recs.iter_pcbs():
                 count += 1
                 self._dispatch_segment_record(type_, pcb, from_zk=True)
         if count:
@@ -143,11 +130,11 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         Add if revocation token to segment ID mappings.
         """
         segment_id = pcb.get_hops_hash()
-        for asm in pcb.ases:
-            self.iftoken2seg[asm.pcbm.ig_rev_token].add(segment_id)
-            self.iftoken2seg[asm.eg_rev_token].add(segment_id)
-            for pm in asm.pms:
-                self.iftoken2seg[pm.ig_rev_token].add(segment_id)
+        for asm in pcb.p.asms:
+            self.iftoken2seg[asm.pcbms[0].igRevToken].add(segment_id)
+            self.iftoken2seg[asm.egRevToken].add(segment_id)
+            for pm in asm.pcbms:
+                self.iftoken2seg[pm.igRevToken].add(segment_id)
 
     @abstractmethod
     def _handle_up_segment_record(self, pcb, **kwargs):
@@ -161,8 +148,8 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
     def _handle_core_segment_record(self, pcb, **kwargs):
         raise NotImplementedError
 
-    def _add_segment(self, pcb, seg_db, name):
-        res = seg_db.update(pcb)
+    def _add_segment(self, pcb, seg_db, name, reverse=False):
+        res = seg_db.update(pcb, reverse=reverse)
         if res == DBResult.ENTRY_ADDED:
             self._add_if_mappings(pcb)
             logging.info("%s-Segment registered: %s", name, pcb.short_desc())
@@ -216,10 +203,10 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         :param if_id: The interface ID of the corresponding interface.
         :type if_id: int.
         """
-        if if_id not in self.ifid2addr:
-            logging.error("Interface ID %d not found in ifid2addr.", if_id)
+        if if_id not in self.ifid2er:
+            logging.error("Unknown Interface ID: %d", if_id)
             return
-        next_hop = self.ifid2addr[if_id]
+        next_hop = self.ifid2er[if_id].addr
         self.send(pkt, next_hop)
 
     def _send_path_segments(self, pkt, up=None, core=None, down=None):
@@ -232,7 +219,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         if not (up | core | down):
             logging.warning("No segments to send")
             return
-        seg_req = pkt.get_payload()
+        req = pkt.get_payload()
         rep_pkt = pkt.reversed_copy()
         rep_pkt.set_payload(PathRecordsReply.from_values(
             {PST.UP: up, PST.CORE: core, PST.DOWN: down},
@@ -246,7 +233,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         logging.info(
             "Sending PATH_REPLY with %d segment(s) to:%s "
             "port:%s in response to: %s", len(up | core | down),
-            rep_pkt.addrs.dst, rep_pkt.l4_hdr.dst_port, seg_req.short_desc()
+            rep_pkt.addrs.dst, rep_pkt.l4_hdr.dst_port, req.short_desc(),
         )
         self.send(rep_pkt, next_hop, port)
 
@@ -264,13 +251,11 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
             del self.pending_req[key]
 
     def handle_path_segment_record(self, pkt):
-        seg_rec = pkt.get_payload()
+        seg_recs = pkt.get_payload()
         params = self._dispatch_params(pkt)
         added = set()
-        for type_, pcbs in seg_rec.pcbs.items():
-            for pcb in pcbs:
-                added.update(
-                    self._dispatch_segment_record(type_, pcb, **params))
+        for type_, pcb in seg_recs.iter_pcbs():
+            added.update(self._dispatch_segment_record(type_, pcb, **params))
         # Handling pending requests, basing on added segments.
         for dst_ia, sibra in added:
             self._handle_pending_requests(dst_ia, sibra)
@@ -295,7 +280,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         while queue:
             count += 1
             type_, pcb = queue.popleft()
-            pcbs[type_].append(pcb)
+            pcbs[type_].append(pcb.copy())
             if count >= limit:
                 yield(pcbs)
                 count = 0
@@ -310,11 +295,13 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         """
         raise NotImplementedError
 
-    def _handle_waiting_targets(self, pcb):
+    def _handle_waiting_targets(self, pcb, reverse=False):
         """
         Handle any queries that are waiting for a path to any core AS in an ISD.
         """
-        dst_ia = pcb.get_first_pcbm().isd_as
+        dst_ia = pcb.first_ia()
+        if reverse:
+            dst_ia = pcb.last_ia()
         if not self.is_core_as(dst_ia):
             logging.warning("Invalid waiting target, not a core AS: %s", dst_ia)
             return
@@ -325,7 +312,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         if not targets:
             return
         path = pcb.get_path(reverse_direction=True)
-        src_ia = pcb.get_first_pcbm().isd_as
+        src_ia = pcb.first_ia()
         while targets:
             seg_req = targets.pop(0)
             req_pkt = self._build_packet(
@@ -340,12 +327,8 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         logging.info("Sharing %d segment(s) via ZK", len(self._segs_to_zk))
         for pcb_dict in self._gen_prop_recs(self._segs_to_zk,
                                             limit=self.ZK_SHARE_LIMIT):
-            data = []
-            for type_, pcbs in pcb_dict.items():
-                for pcb in pcbs:
-                    data.append(bytes([type_]))
-                    data.append(pcb.pack())
-            self._zk_write(b"".join(data))
+            seg_recs = PathSegmentRecords.from_values(pcb_dict)
+            self._zk_write(seg_recs.pack())
 
     def _zk_write(self, data):
         hash_ = SHA256.new(data).hexdigest()

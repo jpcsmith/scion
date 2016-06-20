@@ -337,11 +337,10 @@ class ForwardingProxyConnectionHandler(ConnectionHandler):
     Handler class for the SCION forwarding (bridge) proxy.
     """
     server_version = "SCION HTTP Bridge Proxy/" + VERSION
-    unix_target_proxy = '127.0.0.1', 9090
-    target_proxy = '127.%s.%s.254', 9090
+    target_proxy = '127.0.0.1', 9090
 
     def __init__(self, connection, address, conn_id,
-                 scion_mode, kbase, target_isd_as):
+                 scion_mode, kbase, source_isd_as, target_isd_as):
         """
         Create a ConnectionHandler class to handle the incoming
         HTTP(S) request.
@@ -353,9 +352,10 @@ class ForwardingProxyConnectionHandler(ConnectionHandler):
         self.scion_mode = scion_mode
         self.socket_kbase = kbase
         isd_as = ISD_AS(target_isd_as)
-        host = HostAddrIPv4(self.target_proxy[0] % (isd_as[0], isd_as[1]))
+        host = HostAddrIPv4(self.target_proxy[0])
         self.scion_target_proxy = SCIONAddr.from_values(isd_as, host)
         self.scion_target_port = self.target_proxy[1]
+        self.isd_as = source_isd_as
         super().__init__(connection, address, conn_id)
 
     def handle_request(self):
@@ -391,11 +391,13 @@ class ForwardingProxyConnectionHandler(ConnectionHandler):
         """
         if self.scion_mode:
             logging.info("Opening a SCION-socket")
-            soc = ScionClientSocket(L4Proto.SSP)
+            sockdir = "/run/shm/sciond/%s.sock" % self.isd_as
+            soc = ScionClientSocket(L4Proto.SSP, bytes(sockdir, 'ascii'))
             soc.connect(self.scion_target_proxy, self.scion_target_port)
             if self.socket_kbase:
                 self._handle_socket_options(soc)
-                self.socket_kbase.add_socket(soc, self.method, self.path)
+                self.socket_kbase.add_socket(soc, self.conn_id,
+                                             self.method, self.path)
         else:
             soc = self._unix_client_socket()
         return soc
@@ -419,16 +421,16 @@ class ForwardingProxyConnectionHandler(ConnectionHandler):
 
     def _unix_client_socket(self):
         soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        logging.debug("Connecting to %s:%s" % self.unix_target_proxy)
+        logging.debug("Connecting to %s:%s" % self.target_proxy)
         try:
-            soc.connect(self.unix_target_proxy)
+            soc.connect(self.target_proxy)
         except OSError:
             log_exception("Error while connecting to %s:%s" %
-                          self.unix_target_proxy)
+                          self.target_proxy)
             cleanup(soc)
             return None
         logging.debug("Connected to target proxy %s:%s" %
-                      self.unix_target_proxy)
+                      self.target_proxy)
         return soc
 
 
@@ -439,7 +441,8 @@ def cleanup(sock):
         pass
 
 
-def serve_forever(soc, bridge_mode, scion_mode, kbase, target_isd_as):
+def serve_forever(soc, bridge_mode, scion_mode, kbase,
+                  source_isd_as, target_isd_as):
     """
     Serve incoming HTTP requests until a KeyboardInterrupt is received.
     :param soc: Socket object that belongs to the server.
@@ -455,7 +458,7 @@ def serve_forever(soc, bridge_mode, scion_mode, kbase, target_isd_as):
         conn_id = hex_str(os.urandom(CONN_ID_BYTES))
         if bridge_mode:
             params = (ForwardingProxyConnectionHandler, con, addr, conn_id,
-                      scion_mode, kbase, target_isd_as)
+                      scion_mode, kbase, source_isd_as, target_isd_as)
         else:
             params = ConnectionHandler, con, addr, conn_id
 
@@ -463,10 +466,13 @@ def serve_forever(soc, bridge_mode, scion_mode, kbase, target_isd_as):
                          daemon=True).start()
 
 
-def scion_server_socket(server_address):
+def scion_server_socket(server_address, isd_as):
     logging.info("Starting SCION test server application.")
-    soc = ScionServerSocket(L4Proto.SSP)
-    soc.bind(server_address[1])
+    sockdir = "/run/shm/sciond/%s.sock" % isd_as
+    soc = ScionServerSocket(L4Proto.SSP, bytes(sockdir, 'ascii'))
+    host = HostAddrIPv4(server_address[0])
+    saddr = SCIONAddr.from_values(ISD_AS(isd_as), host)
+    soc.bind(server_address[1], saddr)
     soc.listen()
     return soc
 
@@ -536,14 +542,14 @@ def main():
 
     if args.scion and not args.forward:
         logging.info("Starting the server with SCION multi-path socket.")
-        soc = scion_server_socket(server_address)
+        soc = scion_server_socket(server_address, args.target_isd_as)
     else:
         logging.info("Starting the server with UNIX socket.")
         soc = unix_server_socket(server_address)
 
     try:
         serve_forever(soc, args.forward, args.scion, kbase,
-                      args.target_isd_as)
+                      args.source_isd_as, args.target_isd_as)
     except KeyboardInterrupt:
         logging.info("Exiting")
         soc.close()

@@ -82,8 +82,8 @@ DISPATCHER_TIMEOUT = 60.0
 
 #: How often IFID packet is sent to neighboring router.
 IFID_PKT_TOUT = 1
-#: Default MTU
-DEFAULT_MTU = 1500
+#: Default MTU - assumes overlay is ipv4+udp
+DEFAULT_MTU = 1500 - 20 - 8
 #: IPv6 min value
 SCION_MIN_MTU = 1280
 #: Length of opaque fields
@@ -105,3 +105,14 @@ SIBRA_EPHEMERAL_ID_LEN = 16
 SIBRA_BW_FACTOR = 16 * 1024
 #: SIBRA max reservation index
 SIBRA_MAX_IDX = 16
+
+#: Link to child AS
+LINK_CHILD = "CHILD"
+#: Link to parent AS
+LINK_PARENT = "PARENT"
+#: Link to peer AS
+LINK_PEER = "PEER"
+#: Link to other core AS
+LINK_ROUTING = "ROUTING"
+
+PATH_FLAG_SIBRA = "SIBRA"

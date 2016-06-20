@@ -47,6 +47,8 @@ from lib.defines import (
     AS_LIST_FILE,
     DEFAULT_MTU,
     GEN_PATH,
+    LINK_CHILD,
+    LINK_PARENT,
     NETWORKS_FILE,
     PATH_POLICY_FILE,
     SCION_ROUTER_PORT,
@@ -78,10 +80,6 @@ COMMON_DIR = 'endhost'
 ZOOKEEPER_HOST_TMPFS_DIR = "/run/shm/host-zk"
 ZOOKEEPER_TMPFS_DIR = "/run/shm/scion-zk"
 
-LINK_CHILD = "CHILD"
-LINK_PARENT = "PARENT"
-LINK_PEER = "PEER"
-LINK_ROUTING = "ROUTING"
 DEFAULT_LINK_BW = 1000
 
 DEFAULT_BEACON_SERVERS = 1
@@ -217,7 +215,6 @@ class ConfigGenerator(object):
             'MasterASKey': master_as_key.decode("utf-8"),
             'RegisterTime': 5,
             'PropagateTime': 5,
-            'MTU': as_topo["MTU"],
             'CertChainVersion': 0,
             # FIXME(kormat): This seems to always be true..:
             'RegisterPath': True if as_topo["PathServers"] else False,
@@ -444,6 +441,7 @@ class TopoGenerator(object):
                 'UdpPort': SCION_ROUTER_PORT,
                 'ToUdpPort': SCION_ROUTER_PORT,
                 'Bandwidth': attrs.get('bw', DEFAULT_LINK_BW),
+                'MTU': attrs.get('mtu', DEFAULT_MTU),
             }
         }
 

@@ -5,26 +5,31 @@
 #include "Path.h"
 #include "Utils.h"
 
-Path::Path(PathManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8_t *rawPath, size_t pathLen)
+Path::Path(PathManager *manager, PathParams *params)
     : mIndex(-1),
-    mLocalAddr(localAddr),
-    mDstAddr(dstAddr),
+    mLocalAddr(*(params->localAddr)),
+    mDstAddr(*(params->dstAddr)),
     mUp(false),
     mUsed(false),
     mValid(true),
-    mProbeAttempts(0)
+    mProbeAttempts(0),
+    mManager(manager)
 {
     mSocket = manager->getSocket();
-    if (pathLen == 0) {
+    if (params->pathLen == 0) {
         // raw data is in daemon reply format
-        uint8_t *ptr = rawPath;
-        mPathLen = *rawPath * 8;
-        ptr++;
+        uint8_t *ptr = params->rawPath;
+        if (ptr) {
+            mPathLen = *ptr * 8;
+            ptr++;
+        } else {
+            mPathLen = 0;
+        }
         if (mPathLen == 0) {
             // empty path
             mPath = NULL;
-            mFirstHop.addr_len = dstAddr.host.addr_len;
-            memcpy(mFirstHop.addr, dstAddr.host.addr, mFirstHop.addr_len);
+            mFirstHop.addr_len = mDstAddr.host.addr_len;
+            memcpy(mFirstHop.addr, mDstAddr.host.addr, mFirstHop.addr_len);
             mFirstHop.port = SCION_UDP_EH_DATA_PORT;
             mMTU = SCION_DEFAULT_MTU;
         } else {
@@ -38,8 +43,8 @@ Path::Path(PathManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8
             mFirstHop.port = ntohs(*(uint16_t *)ptr);
             ptr += 2;
 #ifdef BYPASS_ROUTERS
-            mFirstHop.addr_len = dstAddr.host.addr_len;
-            memcpy(mFirstHop.addr, dstAddr.host.addr, mFirstHop.addr_len);
+            mFirstHop.addr_len = mDstAddr.host.addr_len;
+            memcpy(mFirstHop.addr, mDstAddr.host.addr, mFirstHop.addr_len);
             mFirstHop.port = SCION_UDP_EH_DATA_PORT;
 #endif
             mMTU = ntohs(*(uint16_t *)ptr);
@@ -61,13 +66,29 @@ Path::Path(PathManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8
         }
     } else {
         // raw data contains path only
-        mPathLen = pathLen;
+        mPathLen = params->pathLen;
         mPath = (uint8_t *)malloc(mPathLen);
-        memcpy(mPath, rawPath, mPathLen);
+        memcpy(mPath, params->rawPath, mPathLen);
         mMTU = SCION_DEFAULT_MTU;
     }
     gettimeofday(&mLastSendTime, NULL);
     pthread_mutex_init(&mMutex, NULL);
+
+    switch (params->type) {
+        case CC_CBR:
+            mState = new CBRPathState(SCION_DEFAULT_RTT, mMTU);
+            break;
+        case CC_PCC:
+            mState = new PCCPathState(SCION_DEFAULT_RTT, mMTU);
+            break;
+        case CC_RENO:
+            mState = new RenoPathState(SCION_DEFAULT_RTT, mMTU);
+            break;
+        case CC_CUBIC:
+        default:
+            mState = new CUBICPathState(SCION_DEFAULT_RTT, mMTU);
+            break;
+    }
 }
 
 Path::~Path()
@@ -290,16 +311,13 @@ void Path::copySCIONHeader(uint8_t *bufptr, SCIONHeader *sh)
 
 // SSP
 
-SSPPath::SSPPath(SSPConnectionManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8_t *rawPath, size_t pathLen)
-    : Path(manager, localAddr, dstAddr, rawPath, pathLen),
-    mManager(manager),
+SSPPath::SSPPath(SSPConnectionManager *manager, PathParams *params)
+    : Path(manager, params),
     mTotalReceived(0),
     mTotalSent(0),
     mTotalAcked(0),
     mTimeoutCount(0)
 {
-    mState = new CUBICPathState(SCION_DEFAULT_RTT, mMTU);
-
     gettimeofday(&mLastLossTime, NULL);
 
     pthread_mutex_init(&mTimeMutex, NULL);
@@ -365,7 +383,7 @@ void SSPPath::postProcessing(SCIONPacket *packet, bool probe)
     packet->rto = mState->getRTO();
     DEBUG("using rto %d us for path %d\n", packet->rto, mIndex);
     if (!(sh.flags & SSP_ACK) && !probe) {
-        mState->handleSend(be64toh(sh.offset));
+        mState->handleSend(sp->getOffset());
         mTotalSent++;
         pthread_mutex_lock(&mTimeMutex);
         gettimeofday(&mLastSendTime, NULL);
@@ -374,7 +392,7 @@ void SSPPath::postProcessing(SCIONPacket *packet, bool probe)
         mManager->didSend(packet);
         DEBUG("%ld.%06ld: packet %lu(%p) sent on path %d: %d/%d packets in flight\n",
                 mLastSendTime.tv_sec, mLastSendTime.tv_usec,
-                be64toh(sh.offset), packet, mIndex, mState->packetsInFlight(), mState->window());
+                sp->getOffset(), packet, mIndex, mState->packetsInFlight(), mState->window());
     } else if (probe) {
         mProbeAttempts++;
         if (mProbeAttempts >= SSP_PROBE_ATTEMPTS) {
@@ -387,6 +405,7 @@ void SSPPath::postProcessing(SCIONPacket *packet, bool probe)
 
 int SSPPath::sendPacket(SCIONPacket *packet, int sock)
 {
+    DEBUG("path %d: sendPacket\n", mIndex);
     pthread_mutex_lock(&mMutex);
     bool wasValid = mValid;
     int acked = mTotalAcked;
@@ -424,8 +443,7 @@ int SSPPath::sendPacket(SCIONPacket *packet, int sock)
     bufptr = packExtensions(&packet->header, bufptr);
     bufptr = copySSPPacket(sp, bufptr, probe);
 
-    send_dp_header(sock, &mFirstHop, packet_len);
-    send_all(sock, buf, packet_len);
+    mManager->sendRawPacket(buf, packet_len, &mFirstHop);
     free(buf);
 
     if (sendInterfaces) {
@@ -453,14 +471,13 @@ int SSPPath::handleData(SCIONPacket *packet)
 int SSPPath::handleAck(SCIONPacket *packet, bool rttSample)
 {
     SSPPacket *sp = (SSPPacket *)(packet->payload);
-    SSPAck &ack = sp->ack;
     DEBUG("path %d: packet %lu acked, %d packets in flight\n",
-            mIndex, ack.L + ack.I, mState->packetsInFlight() - 1);
+            mIndex, sp->getAckNum(), mState->packetsInFlight() - 1);
     int rtt = elapsedTime(&(packet->sendTime), &(packet->arrivalTime));
     if (!rttSample)
         rtt = 0;
     pthread_mutex_lock(&mWindowMutex);
-    mState->addRTTSample(rtt, ack.L + ack.I);
+    mState->addRTTSample(rtt, sp->getAckNum());
     pthread_mutex_unlock(&mWindowMutex);
     if (mState->isWindowBased())
         pthread_cond_broadcast(&mWindowCond);
@@ -568,8 +585,8 @@ void SSPPath::getStats(SCIONStats *stats)
 
 // SUDP
 
-SUDPPath::SUDPPath(SUDPConnectionManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8_t *rawPath, size_t pathLen)
-    : Path(manager, localAddr, dstAddr, rawPath, pathLen)
+SUDPPath::SUDPPath(SUDPConnectionManager *manager, PathParams *params)
+    : Path(manager, params)
 {
 }
 
@@ -610,8 +627,7 @@ int SUDPPath::sendPacket(SCIONPacket *packet, int sock)
     // Calculate checksum
     update_scion_udp_checksum(buf);
 
-    send_dp_header(sock, &mFirstHop, packet_len);
-    res = send_all(sock, buf, packet_len);
+    res = mManager->sendRawPacket(buf, packet_len, &mFirstHop);
     free(buf);
 
     return res;

@@ -20,7 +20,6 @@ import struct
 from abc import ABCMeta, abstractmethod
 
 # SCION
-from lib.types import PayloadClass
 from lib.util import hex_str
 
 
@@ -53,11 +52,81 @@ class Serializable(object, metaclass=ABCMeta):  # pragma: no cover
         raise NotImplementedError
 
 
+class Cerealizable(object, metaclass=ABCMeta):
+    # P = capnp.load("proto/foo.capnp")
+    # P_CLS = P.Foo
+    def __init__(self, p):
+        assert not isinstance(p, bytes)
+        self.p = p
+        self._packed = False
+
+    @classmethod
+    def from_raw(cls, raw):
+        return cls(cls.P_CLS.from_bytes_packed(raw).as_builder())
+
+    @classmethod
+    def from_raw_multiple(cls, raw):
+        for p in cls.P_CLS.read_multiple_bytes_packed(raw):
+            yield cls(p.as_builder())
+
+    @abstractmethod
+    def from_values(self, *args, **kwargs):
+        raise NotImplementedError
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(cls.P_CLS.new_message(**d))
+
+    def to_dict(self):
+        return self.p.to_dict()
+
+    def pack(self, *args, **kwargs):
+        assert not self._packed, "May only be packed once"
+        self._packed = True
+        return self._pack(*args, **kwargs)
+
+    def _pack(self):
+        return self.p.to_bytes_packed()
+
+    def __bool__(self):
+        return True
+
+    def __len__(self):
+        raise NotImplementedError
+
+    def copy(self):
+        return type(self)(self.p.copy())
+
+    def __copy__(self):
+        return type(self)(self.p.copy())
+
+    def __deepcopy__(self, memo):
+        # http://stackoverflow.com/a/15774013
+        inst = type(self)(self.p.copy())
+        memo[id(self)] = inst
+        return inst
+
+    def __eq__(self, other):  # pragma: no cover
+        return (self.p == other.p)
+
+    def short_desc(self):
+        return str(self.p)
+
+    def __str__(self):
+        return "%s: %s" % (self.NAME, self.short_desc())
+
+
 class L4HeaderBase(Serializable, metaclass=ABCMeta):  # pragma: no cover
     """
     Base class for L4 headers.
     """
     TYPE = None
+
+    def pack(self, payload, checksum=None):
+        self.total_len = self.LEN + len(payload)
+        if checksum is None:
+            checksum = self._calc_checksum(payload)
+        return self._pack(checksum)
 
     @abstractmethod
     def validate(self, payload):
@@ -79,7 +148,7 @@ class PacketBase(Serializable):  # pragma: no cover
         return self._payload
 
     def set_payload(self, new_payload):
-        assert isinstance(new_payload, PayloadBase)
+        assert isinstance(new_payload, (PayloadBase, SCIONPayloadBaseProto))
         self._payload = new_payload
 
 
@@ -100,6 +169,8 @@ class PayloadBase(Serializable):  # pragma: no cover
 
 
 class PayloadRaw(PayloadBase):  # pragma: no cover
+    SNIPPET_LEN = 32
+
     def __init__(self, raw=None):
         self._raw = b""
         super().__init__(raw)
@@ -123,10 +194,14 @@ class PayloadRaw(PayloadBase):  # pragma: no cover
         return len(self._raw)
 
     def __str__(self):
-        return hex_str(self._raw)
+        s = "PayloadRaw(%dB): %s" % (len(self._raw),
+                                     hex_str(self._raw[:self.SNIPPET_LEN]))
+        if len(self._raw) > self.SNIPPET_LEN:
+            s += "[...]"
+        return s
 
 
-class SCIONPayloadBase(PayloadBase):  # pragma: no cover
+class SCIONPayloadBaseProto(Cerealizable):  # pragma: no cover
     """
     All child classes must define two attributes:
         PAYLOAD_CLASS: Global payload class, defined by PayloadClass.
@@ -136,10 +211,8 @@ class SCIONPayloadBase(PayloadBase):  # pragma: no cover
     # 1B each for payload class and type.
     METADATA_LEN = 2
 
+    def pack_full(self):
+        return self.pack_meta() + self.pack()
+
     def pack_meta(self):
         return struct.pack("!BB", self.PAYLOAD_CLASS, self.PAYLOAD_TYPE)
-
-
-class PathMgmtPayloadBase(SCIONPayloadBase):
-    PAYLOAD_CLASS = PayloadClass.PATH
-    PAYLOAD_TYPE = None

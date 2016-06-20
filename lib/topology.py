@@ -23,6 +23,10 @@ from lib.defines import (
     BEACON_SERVICE,
     CERTIFICATE_SERVICE,
     DNS_SERVICE,
+    LINK_CHILD,
+    LINK_PARENT,
+    LINK_PEER,
+    LINK_ROUTING,
     PATH_SERVICE,
     ROUTER_SERVICE,
     SIBRA_SERVICE,
@@ -87,10 +91,12 @@ class InterfaceElement(Element):
         self.to_udp_port = interface_dict['ToUdpPort']
         self.udp_port = interface_dict['UdpPort']
         self.bandwidth = interface_dict['Bandwidth']
+        self.mtu = interface_dict['MTU']
         to_addr = interface_dict['ToAddr']
         self.to_addr = None
         if to_addr:
             self.to_addr = haddr_parse_interface(to_addr)
+        self.to_if_id = 0  # Filled in later by IFID packets
 
 
 class RouterElement(Element):
@@ -131,6 +137,7 @@ class Topology(object):
         self.is_core_as = False
         self.isd_as = None
         self.dns_domain = ""
+        self.mtu = None
         self.beacon_servers = []
         self.certificate_servers = []
         self.dns_servers = []
@@ -173,6 +180,7 @@ class Topology(object):
         self.is_core_as = topology['Core']
         self.isd_as = ISD_AS(topology['ISD_AS'])
         self.dns_domain = topology['DnsDomain']
+        self.mtu = topology['MTU']
         self._parse_srv_dicts(topology)
         self._parse_router_dicts(topology)
         self._parse_zk_dicts(topology)
@@ -192,10 +200,10 @@ class Topology(object):
         for k, v in topology['EdgeRouters'].items():
             router = RouterElement(v, k)
             ntype_map = {
-                'PARENT': self.parent_edge_routers,
-                'CHILD': self.child_edge_routers,
-                'PEER': self.peer_edge_routers,
-                'ROUTING': self.routing_edge_routers,
+                LINK_PARENT: self.parent_edge_routers,
+                LINK_CHILD: self.child_edge_routers,
+                LINK_PEER: self.peer_edge_routers,
+                LINK_ROUTING: self.routing_edge_routers,
             }
             ntype_map[router.interface.link_type].append(router)
 

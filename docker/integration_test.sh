@@ -45,8 +45,8 @@ export -f run log
 
 export PYTHONPATH=.
 
-log "Building C code"
-./scion.sh build
+log "Compiling"
+make -s c install || exit 1
 log "Starting scion"
 ./scion.sh run nobuild | grep -v "RUNNING"
 log "Scion status:"
@@ -54,15 +54,19 @@ log "Scion status:"
 
 sleep 5
 
-# FIXME(kormat): to be reverted to -j0 or so once sciond's api is over a
-# reliable transport.
-cat << EOF | parallel -n2 -j1 run
+cat << EOF | parallel -n2 -j0 run
 End2End
-test/integration/end2end_test.py
+test/integration/end2end_test.py -l ERROR
 C2S_extn
-test/integration/cli_srv_ext_test.py
+test/integration/cli_srv_ext_test.py -l ERROR
 SCMP error
-test/integration/scmp_error_test.py
+test/integration/scmp_error_test.py -l ERROR --runs 60
+Cert/TRC request
+test/integration/cert_req_test.py -l ERROR
+Sibra Ext
+test/integration/sibra_ext_test.py -l ERROR --wait 30 --runs 10
+SSP
+test/integration/ssp_test.py -l ERROR
 EOF
 result=$?
 

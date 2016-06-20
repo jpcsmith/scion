@@ -9,9 +9,24 @@
 #include "PathState.h"
 #include "SCIONDefines.h"
 
+enum CCType {
+    CC_CBR,
+    CC_PCC,
+    CC_RENO,
+    CC_CUBIC,
+};
+
+struct PathParams {
+    SCIONAddr *localAddr;
+    SCIONAddr *dstAddr;
+    uint8_t *rawPath;
+    size_t pathLen;
+    CCType type;
+};
+
 class Path {
 public:
-    Path(PathManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8_t *rawPath, size_t pathLen);
+    Path(PathManager *manager, PathParams *params);
     virtual ~Path();
 
     virtual int sendPacket(SCIONPacket *packet, int sock);
@@ -69,11 +84,13 @@ protected:
     struct timeval  mLastSendTime;
 
     pthread_mutex_t mMutex;
+
+    PathManager *mManager;
 };
 
 class SSPPath : public Path {
 public:
-    SSPPath(SSPConnectionManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8_t *rawPath, size_t pathLen);
+    SSPPath(SSPConnectionManager *manager, PathParams *params);
     ~SSPPath();
 
     virtual int sendPacket(SCIONPacket *packet, int sock);
@@ -98,8 +115,6 @@ protected:
     uint8_t *copySSPPacket(SSPPacket *sp, uint8_t *bufptr, bool probe);
     void postProcessing(SCIONPacket *packet, bool probe);
 
-    SSPConnectionManager *mManager;
-
     int             mTotalReceived;
     int             mTotalSent;
     int             mTotalAcked;
@@ -115,7 +130,7 @@ protected:
 
 class SUDPPath : public Path {
 public:
-    SUDPPath(SUDPConnectionManager *manager, SCIONAddr &localAddr, SCIONAddr &dstAddr, uint8_t *rawPath, size_t pathLen);
+    SUDPPath(SUDPConnectionManager *manager, PathParams *params);
     ~SUDPPath();
 
     int sendPacket(SCIONPacket *packet, int sock);
